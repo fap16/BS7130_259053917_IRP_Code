@@ -1,0 +1,269 @@
+#TGFB1 VS HEALTHY LUNG EXPLANT DIFFERENTIAL EXPRESSION
+
+# =============================================================================
+# PIPELINE 1 — TGFB1 vs HEALTHY LUNG (DMSO control)
+# Single contrast: TGFB1 vs DMSO
+# =============================================================================
+
+library(readxl); library(tidyverse); library(matrixStats)
+library(limma); library(caret); library(NOISeq)
+library(ggplot2); library(ggrepel); library(pheatmap); library(RColorBrewer)
+
+setwd("/home/fap16/final_project")
+
+# =============================================================================
+# STEPS 1-7.5: Data import, filtering, imputation, normalisation, denoising
+# (identical to v4 pipeline — conditions: DMSO + TGFB1 only)
+# =============================================================================
+
+samples <- read_excel("TGFB1Explant_SampleandProteinList_CM.xlsx", sheet = "SampleList")
+proteins <- read_excel("TGFB1Explant_SampleandProteinList_CM.xlsx", sheet = "ProteinList")
+
+samples_f <- samples %>%
+  filter(Condition %in% c("DMSO", "TGFB1")) %>%
+  mutate(Condition = factor(Condition, levels = c("DMSO", "TGFB1")),
+         Donor = factor(Donor))
+
+stopifnot(nrow(samples_f) == 18)
+cat("Design balance:\n"); print(table(samples_f$Condition, samples_f$Donor))
+
+sample_names <- samples_f$MS_Sample_Code
+expr <- proteins %>% select(all_of(sample_names)) %>% as.data.frame()
+rownames(expr) <- make.unique(as.character(proteins$PG.Genes))
+stopifnot(all(colnames(expr) == samples_f$MS_Sample_Code))
+
+# Completeness 70%
+min_v <- ceiling(0.70 * ncol(expr))
+expr_c <- expr[apply(expr, 1, function(x) sum(!is.na(x) & x > 0)) >= min_v, ]
+cat("After completeness:", nrow(expr_c), "\n")
+
+# Impute + log2
+expr_i <- expr_c; expr_i[expr_i == 0] <- NA
+for (j in seq_len(ncol(expr_i))) {
+  cm <- min(expr_i[,j], na.rm=TRUE); if (!is.finite(cm)) cm <- 1
+  expr_i[is.na(expr_i[,j]), j] <- cm / 5 }
+expr_l <- log2(as.matrix(expr_i))
+
+# Median centre
+gm <- median(expr_l); sm <- apply(expr_l, 2, median)
+expr_n <- sweep(expr_l, 2, gm - sm, "+")
+
+# NOISeq abundance + MAD filter
+expr_a <- expr_n[rowMeans(expr_n) > quantile(rowMeans(expr_n), 0.40), ]
+mv <- rowMads(expr_a); expr_v <- expr_a[mv > median(mv), ]
+
+# Caret NZV
+nzv <- nearZeroVar(t(expr_v))
+if (length(nzv) > 0) expr_v <- expr_v[-nzv, ]
+cat("After filtering:", nrow(expr_v), "\n")
+
+# ARSyNseq denoising
+factors_df <- data.frame(Condition = samples_f$Condition, Donor = samples_f$Donor,
+                         row.names = samples_f$MS_Sample_Code)
+nd <- readData(data = as.data.frame(expr_v), factors = factors_df)
+den_obj <- ARSyNseq(nd, factor = "Donor", batch = TRUE, norm = "n", logtransf = TRUE)
+expr_final <- as.matrix(exprs(den_obj))
+expr_final <- expr_final[, samples_f$MS_Sample_Code]
+cat("Final matrix:", nrow(expr_final), "x", ncol(expr_final), "\n\n")
+
+# =============================================================================
+# LIMMA — single contrast model
+# =============================================================================
+
+# 0 + condition used in order to allow multiple sets of comparisons
+design <- model.matrix(~ 0 + Condition, data = samples_f)
+colnames(design) <- levels(samples_f$Condition)
+
+fit <- lmFit(expr_final, design)
+
+contrasts <- makeContrasts(
+  TGFB1_vs_DMSO = TGFB1 - DMSO,
+  levels = design
+)
+
+fit2 <- contrasts.fit(fit, contrasts)
+fit2 <- eBayes(fit2, trend = TRUE)
+
+# Extract results
+results_tgfb1 <- topTable(fit2, coef = "TGFB1_vs_DMSO", number = Inf, sort.by = "P") %>%
+  mutate(negLogP = -log10(P.Value),
+         Direction = case_when(
+           P.Value < 0.05 & logFC >  0.58 ~ "Up in TGFB1",
+           P.Value < 0.05 & logFC < -0.58 ~ "Down in TGFB1",
+           TRUE ~ "Not significant"),
+         Contrast = "TGFB1_vs_DMSO")
+
+cat("=== TGFB1 vs DMSO ===\n")
+cat("Proteins tested:", nrow(results_tgfb1), "\n")
+cat("Raw p < 0.05:", sum(results_tgfb1$P.Value < 0.05), "\n")
+cat("adj.P<0.1:", sum(results_tgfb1$adj.P.Val < 0.1), "\n")
+cat("Nominal p<0.05 & |logFC|>0.58:", sum(results_tgfb1$Direction != "Not significant"), "\n\n")
+
+tgfb1_fdr <- results_tgfb1 %>% filter(adj.P.Val < 0.1) %>% arrange(adj.P.Val)
+
+write.csv(results_tgfb1, "P1/P1_de_results_TGFB1_vs_DMSO.csv", row.names = TRUE)
+write.csv(tgfb1_fdr, "P1/P1__de_FDR_results_TGFB1_vs_DMSO.csv", row.names = TRUE)
+
+###
+
+
+# After results_tgfb1 is created, add:
+sig_tgfb1 <- export_results(results_tgfb1, "TGFB1_vs_DMSO",
+                            "Up in TGFB1", "Down in TGFB1", "P1")
+
+# =============================================================================
+# PCA — all samples coloured by condition
+# =============================================================================
+
+pca <- prcomp(t(expr_final), scale. = TRUE)
+pv  <- round(100 * pca$sdev^2 / sum(pca$sdev^2), 1)
+
+pca_df <- data.frame(PC1 = pca$x[,1], PC2 = pca$x[,2],
+                     Condition = samples_f$Condition,
+                     Donor = samples_f$Donor,
+                     Sample = samples_f$MS_Sample_Code)
+
+p_pca <- ggplot(pca_df, aes(PC1, PC2, colour = Condition)) +
+  geom_point(size = 4.5, alpha = 0.9) +
+  #stat_ellipse(aes(group = Condition), type = "norm", linetype = "dashed", linewidth = 0.7) +
+  scale_colour_manual(values = c("DMSO" = "#2196F3", "TGFB1" = "#E53935")) +
+  theme_classic(base_size = 13) +
+  labs(title = "PCA — TGFB1 vs DMSO (healthy lung)",
+       x = paste0("PC1 (", pv[1], "%)"), y = paste0("PC2 (", pv[2], "%)"))
+print(p_pca)
+ggsave("P1_PCA.pdf", p_pca, width = 7, height = 6)
+
+
+# =============================================================================
+# VOLCANO — TGFB1 vs DMSO
+# =============================================================================
+
+fdr_line <- if (any(results_tgfb1$adj.P.Val < 0.1))
+  -log10(max(results_tgfb1$P.Value[results_tgfb1$adj.P.Val < 0.1])) else -log10(0.05)
+
+
+# LABELS
+
+# Proteins passing FDR<0.1
+fdr_lab <- rownames(results_tgfb1)[results_tgfb1$adj.P.Val < 0.1]
+
+# Top nominal proteins (excluding FDR proteins)
+nominal_lab <- results_tgfb1 %>%
+  filter(Direction != "Not significant",
+         adj.P.Val >= 0.1) %>%
+  arrange(P.Value) %>%
+  slice_head(n = 15) %>%
+  rownames()
+
+results_tgfb1$Label_FDR <- ifelse(
+  rownames(results_tgfb1) %in% fdr_lab,
+  rownames(results_tgfb1),
+  NA
+)
+
+results_tgfb1$Label_nominal <- ifelse(
+  rownames(results_tgfb1) %in% nominal_lab,
+  rownames(results_tgfb1),
+  NA
+)
+
+
+# PLOT
+p_v <- ggplot(results_tgfb1, aes(logFC, negLogP, colour = Direction)) +
+  geom_point(alpha = 0.6, size = 1.8) +
+  geom_hline(yintercept = fdr_line, linetype = "dashed", colour = "grey30", linewidth = 0.7) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dotted", colour = "steelblue", linewidth = 0.7) +
+  geom_vline(xintercept = c(-0.58, 0.58), linetype = "dashed", colour = "grey30", linewidth = 0.7) +
+  scale_colour_manual(values = c(
+    "Up in TGFB1"="#E53935",
+    "Down in TGFB1"="#2196F3",
+    "Not significant"="grey70"
+  )) +
+  
+  geom_text_repel(
+    aes(label = Label_FDR),
+    fontface = "bold",
+    size = 3.4,
+    colour = "black",
+    box.padding = 0.5,
+    max.overlaps = Inf,
+    show.legend = FALSE
+  ) +
+  
+  geom_text_repel(
+    aes(label = Label_nominal),
+    fontface = "italic",
+    size = 2.8,
+    colour = "black",
+    box.padding = 0.4,
+    max.overlaps = 20,
+    show.legend = FALSE
+  ) +
+  
+  annotate("text", x=Inf, y=fdr_line+0.1, label="FDR=0.1",
+           hjust=1.1, size=3.2, colour="grey30") +
+  annotate("text", x=Inf, y=-log10(0.05)+0.1, label="p=0.05",
+           hjust=1.1, size=3.2, colour="steelblue") +
+  theme_classic(base_size = 13) +
+  labs(
+    title = "Volcano: TGFB1 vs DMSO",
+    subtitle = "FDR= 0.1 Bold, Nominal p<0.05 & |logFC|>0.58 coloured",
+    x = expression(log[2]~"FC"),
+    y = expression(-log[10]~"(p)"),
+    colour = NULL
+  ) +
+  theme(legend.position = "bottom")
+
+
+print(p_v)
+ggsave("P1/P1_Volcano_TGFB1_vs_DMSO.pdf", p_v, width = 7.5, height = 6.5)
+
+# =============================================================================
+# HEATMAP — significant proteins across all contrasts (just one here)
+# =============================================================================
+
+sig_all <- results_tgfb1 %>% filter(Direction != "Not significant")
+
+if (nrow(sig_all) >= 2) {
+  hm <- expr_final[rownames(sig_all), , drop = FALSE]
+  hm_z <- pmin(pmax(t(scale(t(hm))), -2), 2)
+  col_ord <- order(samples_f$Condition)
+  col_ann <- data.frame(
+    Condition = samples_f$Condition[col_ord],
+    Donor = factor(samples_f$Donor[col_ord]),
+    row.names = samples_f$MS_Sample_Code[col_ord]
+  )
+  row_ann <- data.frame(Direction = sig_all$Direction, row.names = rownames(sig_all))
+  ph <- pheatmap(hm_z[, col_ord],
+                 annotation_col = col_ann, annotation_row = row_ann,
+                 annotation_colors = list(
+                   Condition = c(
+                     "DMSO"="#2196F3",
+                     "TGFB1"="#E53935"),
+                   
+                   Donor = c(
+                     "NFC264"="#66C2A5",
+                     "NFC265"="#FC8D62",
+                     "NFC266"="#8DA0CB"),
+                   
+                   Direction = c(
+                     "Up in TGFB1"="#E53935",
+                     "Down in TGFB1"="#2196F3")),
+                 cluster_cols = FALSE, cluster_rows = TRUE,
+                 show_rownames = nrow(hm_z) <= 80, show_colnames = FALSE,
+                 color = colorRampPalette(c("#2166AC","white","#B2182B"))(100),
+                 breaks = seq(-2, 2, length.out = 101), border_color = NA,
+                 main = paste0(
+                   "Differentially expressed proteins following TGFB1 stimulation",
+                   "\n",
+                   "n = ", nrow(hm_z), " proteins (FDR = 0.1, p < 0.05, |log2FC| > 0.58)"
+                 ),
+                 fontsize_row = 7, fontsize = 10, silent = TRUE)
+  print(ph)
+  pdf("P1/P1_Heatmap.pdf", width = 11, height = max(7, nrow(hm_z) * 0.22)); print(ph); dev.off()
+  cat("Saved: P1_Heatmap.pdf\n")
+} else cat("< 2 significant proteins — heatmap skipped\n")
+
+
+
+cat("\n=== PIPELINE 1 COMPLETE ===\n")
