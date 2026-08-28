@@ -1,1 +1,1849 @@
 
+# IPF DIFFERENTIAL EXPRESSION ANALYSIS
+# Pipeline 2 — IPF dataset
+#
+# 3 Contrasts:
+#   1. Baseline   : day7_DMSO - day0_SF (just for ref)
+#   2. Nintedanib : day7_Nin  - day7_DMSO 
+#   3. Senicapoc  : day7_Senic - day7_DMSO
+#
+# FDR threshold: < 0.1
+# Fold-change threshold: |log2FC| > 0.58
+
+#########################################
+#STEP 0 SET UP
+
+# 1. PACKAGES & SETUP
+
+library(readxl)
+library(tidyverse)
+library(matrixStats)
+library(limma)
+library(caret)
+library(NOISeq)
+library(ggplot2)
+library(ggrepel)
+library(pheatmap)
+library(RColorBrewer)
+library(patchwork)
+
+setwd("/home/fap16/final_project")
+
+dir.create("P2", showWarnings = FALSE)
+
+
+# 2. IMPORT DATA
+
+samples_ipf <- read_excel(
+  "IPF_Donors_SampleandProteinList_CM.xlsx",
+  sheet = "SampleList"
+) %>%
+  filter(
+    !is.na(MS_code),
+    trimws(MS_code) != ""
+  )
+
+proteins_ipf <- read_excel(
+  "IPF_Donors_SampleandProteinList_CM.xlsx",
+  sheet = "ProteinList"
+)
+
+# 3. FILTER SAMPLES
+
+samples_f <- samples_ipf %>%
+  filter(
+    Condition %in% c(
+      "day0_SF",
+      "day7_DMSO",
+      "day7_Nin",
+      "day7_Senic"
+    )
+  ) %>%
+  mutate(
+    Condition = factor(
+      Condition,
+      levels = c(
+        "day0_SF",
+        "day7_DMSO",
+        "day7_Nin",
+        "day7_Senic"
+      )
+    ),
+    Donor = factor(Donor)
+  )
+
+cat("=== SAMPLE INFORMATION ===\n")
+cat("Samples retained:", nrow(samples_f), "\n\n")
+
+cat("Design balance:\n")
+print(table(samples_f$Condition, samples_f$Donor))
+
+
+
+# 4. COLOUR SCHEMES - for plots 
+
+condition_colours <- c(
+  day0_SF = "#2196F3",
+  day7_DMSO = "#E53935",
+  day7_Nin = "#4CAF50",
+  day7_Senic = "#FF9800"
+)
+
+day7_colours <- c(
+  day7_DMSO = "#E53935",
+  day7_Nin = "#4CAF50",
+  day7_Senic = "#FF9800"
+)
+
+
+# 5. EXPRESSION MATRIX
+
+sample_codes <- samples_f$Sample_code
+
+expr <- proteins_ipf %>%
+  select(all_of(sample_codes)) %>%
+  mutate(
+    across(
+      everything(),
+      ~ as.numeric(as.character(.))
+    )
+  ) %>%
+  as.data.frame()
+
+rownames(expr) <- make.unique(
+  as.character(proteins_ipf$PG.Genes)
+)
+
+stopifnot(
+  all(colnames(expr) == samples_f$Sample_code)
+)
+
+cat(
+  "\nExpression matrix:",
+  nrow(expr),
+  "proteins x",
+  ncol(expr),
+  "samples\n"
+)
+
+#######################################################
+#STEP 1 - RAW DATA PREPROCESSING 
+
+# 6. COMPLETENESS FILTER — 70%
+
+min_values <- ceiling(
+  0.70 * ncol(expr)
+)
+
+expr_c <- expr[
+  apply(
+    expr,
+    1,
+    function(x) {
+      sum(!is.na(x) & x > 0) >= min_values
+    }
+  ),
+  ,
+  drop = FALSE
+]
+
+cat(
+  "After completeness filtering:",
+  nrow(expr_c),
+  "proteins\n"
+)
+
+
+# 7. IMPUTATION & LOG2 TRANSFORMATION
+
+expr_i <- expr_c
+
+expr_i[expr_i == 0] <- NA
+
+for (j in seq_len(ncol(expr_i))) {
+
+  column_min <- min(
+    expr_i[, j],
+    na.rm = TRUE
+  )
+
+  if (!is.finite(column_min)) {
+    column_min <- 1
+  }
+
+  expr_i[is.na(expr_i[, j]), j] <- column_min / 5
+}
+
+expr_l <- log2(
+  as.matrix(expr_i)
+)
+
+
+# 8. MEDIAN NORMALISATION
+
+global_median <- median(expr_l)
+
+sample_medians <- apply(
+  expr_l,
+  2,
+  median
+)
+
+expr_n <- sweep(
+  expr_l,
+  2,
+  global_median - sample_medians,
+  "+"
+)
+
+
+# 9. ABUNDANCE & VARIABILITY FILTERING
+
+# Abundance filter
+expr_a <- expr_n[
+  rowMeans(expr_n) >
+    quantile(rowMeans(expr_n), 0.40),
+  ,
+  drop = FALSE
+]
+
+# MAD filter
+median_absolute_deviation <- rowMads(expr_a)
+
+expr_v <- expr_a[
+  median_absolute_deviation >
+    median(median_absolute_deviation),
+  ,
+  drop = FALSE
+]
+
+# Near-zero variance filter
+nzv <- nearZeroVar(
+  t(expr_v)
+)
+
+if (length(nzv) > 0) {
+  expr_v <- expr_v[
+    -nzv,
+    ,
+    drop = FALSE
+  ]
+}
+
+cat(
+  "After filtering:",
+  nrow(expr_v),
+  "proteins\n"
+)
+
+
+# 10. ARSYNSEQ DENOISING
+
+factors_df <- data.frame(
+  Condition = samples_f$Condition,
+  Donor = samples_f$Donor,
+  row.names = samples_f$Sample_code
+)
+
+nd <- readData(
+  data = as.data.frame(expr_v),
+  factors = factors_df
+)
+
+den_obj <- ARSyNseq(
+  nd,
+  factor = "Donor",
+  batch = TRUE,
+  norm = "n",
+  logtransf = TRUE
+)
+
+expr_final <- as.matrix(
+  exprs(den_obj)
+)
+
+expr_final <- expr_final[
+  ,
+  samples_f$Sample_code,
+  drop = FALSE
+]
+
+cat(
+  "Final matrix:",
+  nrow(expr_final),
+  "proteins x",
+  ncol(expr_final),
+  "samples\n\n"
+)
+
+##############################################################
+#STEP 2 DIFFERERNTIAL EXPRESSION ANALYSIS 
+
+# 11. LIMMA MODEL
+
+design <- model.matrix(
+  ~ 0 + Condition,
+  data = samples_f
+)
+
+colnames(design) <- levels(
+  samples_f$Condition
+)
+
+fit <- lmFit(
+  expr_final,
+  design
+)
+
+
+# 12. CONTRASTS - individually make contrasts
+#clearly define contrasts using makeContrasts func so that individual expression is estimated
+  # not grouped exp!!
+contrasts <- makeContrasts(
+
+  # Disease/time effect:
+  # day 7 IPF tissue compared with day 0 control
+  Baseline = day7_DMSO - day0_SF,
+
+  # Drug effects:
+  Nintedanib = day7_Nin - day7_DMSO,
+  Senicapoc = day7_Senic - day7_DMSO,
+
+  levels = design
+)
+
+
+fit2 <- contrasts.fit(
+  fit,
+  contrasts
+)
+
+fit2 <- eBayes(
+  fit2,
+  trend = TRUE
+)
+
+# 13. RESULT EXTRACTION FUNCTION
+
+extract_results <- function(
+    fit_object,
+    contrast_name,
+    up_label,
+    down_label
+) {
+
+  results <- topTable(
+    fit_object,
+    coef = contrast_name,
+    number = Inf,
+    sort.by = "P"
+  ) %>%
+    mutate(
+
+      negLogP = -log10(P.Value),
+
+      Direction = case_when(
+        adj.P.Val < 0.1 &
+          logFC > 0.58 ~ up_label,
+
+        adj.P.Val < 0.1 &
+          logFC < -0.58 ~ down_label,
+
+        TRUE ~ "Not significant"
+      ),
+
+      Contrast = contrast_name
+    )
+
+
+  cat("\n========================================\n")
+  cat(contrast_name, "\n")
+  cat("========================================\n")
+
+  cat(
+    "Proteins tested:",
+    nrow(results),
+    "\n"
+  )
+
+  cat(
+    "Raw p < 0.05:",
+    sum(results$P.Value < 0.05),
+    "\n"
+  )
+
+  cat(
+    "FDR < 0.1:",
+    sum(results$adj.P.Val < 0.1),
+    "\n"
+  )
+
+  cat(
+    "FDR < 0.1 & |logFC| > 0.58:",
+    sum(
+      results$adj.P.Val < 0.1 &
+        abs(results$logFC) > 0.58
+    ),
+    "\n"
+  )
+
+  cat(
+    "Up:",
+    sum(results$Direction == up_label),
+    "\n"
+  )
+
+  cat(
+    "Down:",
+    sum(results$Direction == down_label),
+    "\n"
+  )
+
+  return(results)
+}
+
+
+# 14. RUN ALL THREE CONTRASTS - simultaneously done!!
+
+results_baseline <- extract_results(
+  fit2,
+  "Baseline",
+  "Up in day7_DMSO",
+  "Down in day7_DMSO"
+)
+
+results_nintedanib <- extract_results(
+  fit2,
+  "Nintedanib",
+  "Up in Nintedanib",
+  "Down in Nintedanib"
+)
+
+results_senicapoc <- extract_results(
+  fit2,
+  "Senicapoc",
+  "Up in Senicapoc",
+  "Down in Senicapoc"
+)
+
+
+# 15. EXPORT RESULTS
+
+export_results <- function(
+    results,
+    contrast_name,
+    up_label,
+    down_label,
+    prefix = "P2"
+) {
+
+  # Full results
+  write.csv(
+    results,
+    paste0(
+      prefix,
+      "_",
+      contrast_name,
+      "_all_proteins.csv"
+    ),
+    row.names = TRUE
+  )
+
+
+  # FDR-significant proteins
+  sig <- results %>%
+    filter(
+      adj.P.Val < 0.1,
+      abs(logFC) > 0.58
+    ) %>%
+    arrange(adj.P.Val) %>%
+    select(
+      logFC,
+      AveExpr,
+      t,
+      P.Value,
+      adj.P.Val,
+      negLogP,
+      Direction
+    )
+
+  write.csv(
+    sig,
+    paste0(
+      prefix,
+      "_",
+      contrast_name,
+      "_FDR_significant.csv"
+    ),
+    row.names = TRUE
+  )
+
+
+  # Top 10 upregulated
+  top_up <- results %>%
+    filter(
+      adj.P.Val < 0.1,
+      logFC > 0.58
+    ) %>%
+    arrange(desc(logFC)) %>%
+    slice_head(n = 10) %>%
+    mutate(
+      FoldChange = round(2^logFC, 3),
+      logFC = round(logFC, 3),
+      P.Value = signif(P.Value, 3),
+      adj.P.Val = signif(adj.P.Val, 3)
+    ) %>%
+    select(
+      logFC,
+      FoldChange,
+      P.Value,
+      adj.P.Val,
+      Direction
+    )
+
+
+  # Top 10 downregulated
+  top_down <- results %>%
+    filter(
+      adj.P.Val < 0.1,
+      logFC < -0.58
+    ) %>%
+    arrange(logFC) %>%
+    slice_head(n = 10) %>%
+    mutate(
+      FoldChange = round(2^logFC, 3),
+      logFC = round(logFC, 3),
+      P.Value = signif(P.Value, 3),
+      adj.P.Val = signif(adj.P.Val, 3)
+    ) %>%
+    select(
+      logFC,
+      FoldChange,
+      P.Value,
+      adj.P.Val,
+      Direction
+    )
+
+
+  top20 <- bind_rows(
+    top_up,
+    top_down
+  )
+
+  write.csv(
+    top20,
+    paste0(
+      prefix,
+      "_",
+      contrast_name,
+      "_top20_FC.csv"
+    ),
+    row.names = TRUE
+  )
+
+
+  cat(
+    "\nSaved:",
+    contrast_name,
+    "\n"
+  )
+
+  cat(
+    "  All proteins:",
+    nrow(results),
+    "\n"
+  )
+
+  cat(
+    "  FDR significant:",
+    nrow(sig),
+    "\n"
+  )
+
+  cat(
+    "  Up:",
+    sum(sig$Direction == up_label),
+    "\n"
+  )
+
+  cat(
+    "  Down:",
+    sum(sig$Direction == down_label),
+    "\n"
+  )
+
+  return(sig)
+}
+
+
+sig_baseline <- export_results(
+  results_baseline,
+  "Baseline",
+  "Up in day7_DMSO",
+  "Down in day7_DMSO"
+)
+
+sig_nintedanib <- export_results(
+  results_nintedanib,
+  "Nintedanib",
+  "Up in Nintedanib",
+  "Down in Nintedanib"
+)
+
+sig_senicapoc <- export_results(
+  results_senicapoc,
+  "Senicapoc",
+  "Up in Senicapoc",
+  "Down in Senicapoc"
+)
+
+#############################################
+#STEP 3 DATA VISUALISATION
+
+# 16. FULL-PROTEOME PCA
+
+pca_full <- prcomp(
+  t(expr_final),
+  scale. = TRUE
+)
+
+pca_full_variance <- round(
+  100 *
+    pca_full$sdev^2 /
+    sum(pca_full$sdev^2),
+  1
+)
+
+pca_df <- data.frame(
+  PC1 = pca_full$x[, 1],
+  PC2 = pca_full$x[, 2],
+  Condition = samples_f$Condition,
+  Donor = samples_f$Donor,
+  Sample = samples_f$Sample_code
+)
+
+
+# Plot day 7 conditions only
+pca_day7 <- pca_df %>%
+  filter(
+    Condition != "day0_SF"
+  ) %>%
+  mutate(
+    Condition = droplevels(Condition)
+  )
+
+
+# Calculate centroids
+centroids <- pca_day7 %>%
+  group_by(Condition) %>%
+  summarise(
+    PC1 = mean(PC1),
+    PC2 = mean(PC2),
+    .groups = "drop"
+  )
+
+
+# Create treatment trajectory arrows
+get_centroid <- function(condition) {
+  centroids %>%
+    filter(Condition == condition)
+}
+
+arrow_df <- bind_rows(
+
+  data.frame(
+    x = get_centroid("day7_DMSO")$PC1,
+    y = get_centroid("day7_DMSO")$PC2,
+    xend = get_centroid("day7_Nin")$PC1,
+    yend = get_centroid("day7_Nin")$PC2
+  ),
+
+  data.frame(
+    x = get_centroid("day7_DMSO")$PC1,
+    y = get_centroid("day7_DMSO")$PC2,
+    xend = get_centroid("day7_Senic")$PC1,
+    yend = get_centroid("day7_Senic")$PC2
+  )
+)
+
+
+p_full_pca <- ggplot(
+  pca_day7,
+  aes(
+    PC1,
+    PC2,
+    colour = Condition
+  )
+) +
+
+  geom_point(
+    size = 4,
+    alpha = 0.85
+  ) +
+
+  stat_ellipse(
+    aes(group = Condition),
+    type = "norm",
+    linetype = "dashed",
+    linewidth = 0.5,
+    fill = NA
+  ) +
+
+  geom_segment(
+    data = arrow_df,
+    aes(
+      x = x,
+      y = y,
+      xend = xend,
+      yend = yend
+    ),
+    arrow = arrow(
+      length = unit(
+        0.18,
+        "cm"
+      ),
+      type = "closed"
+    ),
+    colour = "grey50",
+    linewidth = 0.4,
+    inherit.aes = FALSE
+  ) +
+
+  geom_label(
+    data = centroids,
+    aes(
+      PC1,
+      PC2,
+      label = Condition,
+      colour = Condition
+    ),
+    size = 2.8,
+    fontface = "bold",
+    show.legend = FALSE,
+    fill = "white",
+    alpha = 0.8
+  ) +
+
+  scale_colour_manual(
+    values = day7_colours
+  ) +
+
+  theme_classic(
+    base_size = 13
+  ) +
+
+  labs(
+    title = "IPF PCA — Full Denoised Proteome",
+    subtitle = "Treatment trajectories from day7_DMSO",
+    x = paste0(
+      "PC1 (",
+      pca_full_variance[1],
+      "%)"
+    ),
+    y = paste0(
+      "PC2 (",
+      pca_full_variance[2],
+      "%)"
+    )
+  )
+
+print(p_full_pca)
+
+ggsave(
+  "P2/P2_PCA_fullproteome_day7only.pdf",
+  p_full_pca,
+  width = 8,
+  height = 7
+) 
+
+# 17. VOLCANO PLOT 
+
+make_volcano <- function(
+    results,
+    title,
+    up_colour,
+    down_colour,
+    filename
+) {
+
+  fdr_line <- if (
+    any(results$adj.P.Val < 0.1)
+  ) {
+
+    -log10(
+      max(
+        results$P.Value[
+          results$adj.P.Val < 0.1
+        ]
+      )
+    )
+
+  } else {
+
+    -log10(0.05)
+  }
+
+
+  # Label top 15 nominally significant proteins
+  top_labels <- results %>%
+    filter(
+      Direction != "Not significant"
+    ) %>%
+    arrange(P.Value) %>%
+    slice_head(n = 15) %>%
+    rownames()
+
+
+  results <- results %>%
+    mutate(
+      Label = ifelse(
+        rownames(.) %in% top_labels,
+        rownames(.),
+        NA
+      )
+    )
+
+
+  direction_levels <- unique(
+    results$Direction[
+      results$Direction != "Not significant"
+    ]
+  )
+
+  colour_values <- setNames(
+    c(
+      up_colour,
+      down_colour,
+      "grey70"
+    ),
+    c(
+      direction_levels,
+      "Not significant"
+    )
+  )
+
+
+  p <- ggplot(
+    results,
+    aes(
+      logFC,
+      negLogP,
+      colour = Direction
+    )
+  ) +
+
+    geom_point(
+      alpha = 0.6,
+      size = 1.8
+    ) +
+
+    geom_hline(
+      yintercept = fdr_line,
+      linetype = "dashed",
+      colour = "grey30",
+      linewidth = 0.7
+    ) +
+
+    geom_hline(
+      yintercept = -log10(0.05),
+      linetype = "dotted",
+      colour = "steelblue",
+      linewidth = 0.7
+    ) +
+
+    geom_vline(
+      xintercept = c(
+        -0.58,
+        0.58
+      ),
+      linetype = "dashed",
+      colour = "grey30",
+      linewidth = 0.7
+    ) +
+
+    scale_colour_manual(
+      values = colour_values
+    ) +
+
+    geom_text_repel(
+      aes(label = Label),
+      size = 2.8,
+      max.overlaps = 20,
+      box.padding = 0.4,
+      colour = "black",
+      show.legend = FALSE
+    ) +
+
+    annotate(
+      "text",
+      x = Inf,
+      y = fdr_line + 0.1,
+      label = "FDR = 0.1",
+      hjust = 1.1,
+      size = 3.2,
+      colour = "grey30"
+    ) +
+
+    theme_classic(
+      base_size = 13
+    ) +
+
+    labs(
+      title = title,
+      subtitle = "FDR < 0.1 & |log2FC| > 0.58 coloured",
+      x = expression(log[2] ~ "FC"),
+      y = expression(-log[10] ~ "(p)"),
+      colour = NULL
+    ) +
+
+    theme(
+      legend.position = "bottom"
+    )
+
+
+  print(p)
+
+  ggsave(
+    filename,
+    p,
+    width = 7.5,
+    height = 6.5
+  )
+}
+
+
+# Generate volcano plots
+make_volcano(
+  results_baseline,
+  "Volcano: day7_DMSO vs day0_SF (IPF baseline)",
+  "#E53935",
+  "#2196F3",
+  "P2/P2_Volcano_Baseline.pdf"
+)
+
+make_volcano(
+  results_nintedanib,
+  "Volcano: Nintedanib vs day7_DMSO",
+  "#4CAF50",
+  "#9C27B0",
+  "P2/P2_Volcano_Nintedanib.pdf"
+)
+
+make_volcano(
+  results_senicapoc,
+  "Volcano: Senicapoc vs day7_DMSO",
+  "#FF9800",
+  "#9C27B0",
+  "P2/P2_Volcano_Senicapoc.pdf"
+)
+
+# 18. HEATMAP — UNION OF SIGNIFICANT PROTEINS
+
+sig_baseline_names <- rownames(
+  sig_baseline
+)
+
+sig_nintedanib_names <- rownames(
+  sig_nintedanib
+)
+
+sig_senicapoc_names <- rownames(
+  sig_senicapoc
+)
+
+sig_union <- unique(
+  c(
+    sig_baseline_names,
+    sig_nintedanib_names,
+    sig_senicapoc_names
+  )
+)
+
+cat(
+  "\nSignificant proteins across all contrasts:",
+  length(sig_union),
+  "\n"
+)
+
+
+if (length(sig_union) >= 2) {
+
+  hm <- expr_final[
+    sig_union,
+    ,
+    drop = FALSE
+  ]
+
+  hm_z <- t(
+    scale(
+      t(hm)
+    )
+  )
+
+  hm_z <- pmin(
+    pmax(hm_z, -2),
+    2
+  )
+
+
+  col_order <- order(
+    samples_f$Condition
+  )
+
+  col_ann <- data.frame(
+    Condition = samples_f$Condition[col_order],
+    row.names = samples_f$Sample_code[col_order]
+  )
+
+
+  row_ann <- data.frame(
+
+    Baseline = ifelse(
+      sig_union %in% sig_baseline_names,
+      "Yes",
+      "No"
+    ),
+
+    Nintedanib = ifelse(
+      sig_union %in% sig_nintedanib_names,
+      "Yes",
+      "No"
+    ),
+
+    Senicapoc = ifelse(
+      sig_union %in% sig_senicapoc_names,
+      "Yes",
+      "No"
+    ),
+
+    row.names = sig_union
+  )
+
+
+  annotation_colours <- list(
+
+    Condition = condition_colours,
+
+    Baseline = c(
+      Yes = "#E53935",
+      No = "grey90"
+    ),
+
+    Nintedanib = c(
+      Yes = "#4CAF50",
+      No = "grey90"
+    ),
+
+    Senicapoc = c(
+      Yes = "#FF9800",
+      No = "grey90"
+    )
+  )
+
+
+  ph <- pheatmap(
+    hm_z[, col_order],
+    annotation_col = col_ann,
+    annotation_row = row_ann,
+    annotation_colors = annotation_colours,
+    cluster_cols = FALSE,
+    cluster_rows = TRUE,
+    show_rownames = length(sig_union) <= 80,
+    show_colnames = FALSE,
+    fontsize_row = 7,
+    fontsize = 9,
+    color = colorRampPalette(
+      c(
+        "#2166AC",
+        "white",
+        "#B2182B"
+      )
+    )(100),
+    breaks = seq(
+      -2,
+      2,
+      length.out = 101
+    ),
+    border_color = NA,
+    main = paste0(
+      "IPF significant proteins — all contrasts\n",
+      "n = ",
+      length(sig_union)
+    ),
+    silent = TRUE
+  )
+
+  print(ph)
+
+  pdf(
+    "P2/P2_Heatmap_all_contrasts.pdf",
+    width = 12,
+    height = max(
+      8,
+      length(sig_union) * 0.22
+    )
+  )
+
+  print(ph)
+  dev.off()
+
+  cat(
+    "Saved: P2/P2_Heatmap_all_contrasts.pdf\n"
+  )
+
+} else {
+
+  cat(
+    "< 2 significant proteins — heatmap skipped\n"
+  )
+}
+
+
+# =============================================================================
+# 19. HEATMAP — TOP 50 BASELINE PROTEINS
+# =============================================================================
+
+top50 <- results_baseline %>%
+  filter(
+    adj.P.Val < 0.1
+  ) %>%
+  arrange(
+    adj.P.Val
+  ) %>%
+  slice_head(n = 50)
+
+top50_genes <- rownames(
+  top50
+)
+
+
+if (length(top50_genes) >= 2) {
+
+  hm <- expr_final[
+    top50_genes,
+    ,
+    drop = FALSE
+  ]
+
+  hm_z <- t(
+    scale(
+      t(hm)
+    )
+  )
+
+  hm_z <- pmin(
+    pmax(hm_z, -2),
+    2
+  )
+
+
+  col_order <- order(
+    samples_f$Condition
+  )
+
+
+  col_ann <- data.frame(
+    Condition = samples_f$Condition[col_order],
+    row.names = samples_f$Sample_code[col_order]
+  )
+
+
+  # Gene descriptions
+  gene_info <- proteins_ipf %>%
+    select(
+      PG.Genes,
+      PG.ProteinDescriptions
+    ) %>%
+    distinct()
+
+
+  descriptions <- gene_info$PG.ProteinDescriptions[
+    match(
+      top50_genes,
+      gene_info$PG.Genes
+    )
+  ]
+
+  descriptions[
+    is.na(descriptions) |
+      descriptions == ""
+  ] <- top50_genes[
+    is.na(descriptions) |
+      descriptions == ""
+  ]
+
+
+  row_labels <- paste(
+    top50_genes,
+    descriptions,
+    sep = "\n"
+  )
+
+  names(row_labels) <- top50_genes
+
+
+  ph_top50 <- pheatmap(
+    hm_z[, col_order],
+    labels_row = row_labels,
+    annotation_col = col_ann,
+    annotation_colors = list(
+      Condition = condition_colours
+    ),
+    cluster_cols = FALSE,
+    cluster_rows = TRUE,
+    show_colnames = FALSE,
+    show_rownames = TRUE,
+    fontsize_row = 7,
+    fontsize = 9,
+    color = colorRampPalette(
+      c(
+        "#2166AC",
+        "white",
+        "#B2182B"
+      )
+    )(100),
+    breaks = seq(
+      -2,
+      2,
+      length.out = 101
+    ),
+    border_color = NA,
+    main = "Top 50 fibrosis proteins — Baseline",
+    silent = TRUE
+  )
+
+
+  print(ph_top50)
+
+  pdf(
+    "P2/P2_Heatmap_Top50_Baseline.pdf",
+    width = 10,
+    height = 12
+  )
+
+  print(ph_top50)
+  dev.off()
+
+  cat(
+    "Saved: P2/P2_Heatmap_Top50_Baseline.pdf\n"
+  )
+
+} else {
+
+  cat(
+    "< 2 baseline FDR-significant proteins — top 50 heatmap skipped\n"
+  )
+}
+
+
+# =============================================================================
+# 20. PROTEIN CATEGORIES
+#
+# Baseline only = disease-associated but not drug-responsive
+# Drug only      = drug-associated but not baseline-associated
+# Shared         = disease-associated AND responsive to ≥1 drug
+# =============================================================================
+
+baseline_names <- rownames(
+  sig_baseline
+)
+
+nintedanib_names <- rownames(
+  sig_nintedanib
+)
+
+senicapoc_names <- rownames(
+  sig_senicapoc
+)
+
+
+baseline_only <- setdiff(
+  baseline_names,
+  union(
+    nintedanib_names,
+    senicapoc_names
+  )
+)
+
+drug_only <- setdiff(
+  union(
+    nintedanib_names,
+    senicapoc_names
+  ),
+  baseline_names
+)
+
+shared <- intersect(
+  baseline_names,
+  union(
+    nintedanib_names,
+    senicapoc_names
+  )
+)
+
+
+cat("\n=== P2 PROTEIN CATEGORIES ===\n")
+
+cat(
+  "Baseline only:",
+  length(baseline_only),
+  "\n"
+)
+
+cat(
+  "Drug only:",
+  length(drug_only),
+  "\n"
+)
+
+cat(
+  "Shared:",
+  length(shared),
+  "\n"
+)
+
+# 21. CATEGORY HEATMAP FUNCTION
+
+results_list <- list(
+  results_baseline,
+  results_nintedanib,
+  results_senicapoc
+)
+
+contrast_labels <- c(
+  "Baseline",
+  "Nintedanib",
+  "Senicapoc"
+)
+
+
+make_category_heatmap <- function(
+    proteins,
+    expr_mat,
+    samples_df,
+    results_list,
+    contrast_names,
+    colours,
+    title,
+    filename
+) {
+
+  if (length(proteins) < 2) {
+
+    cat(
+      "Too few proteins for:",
+      title,
+      "\n"
+    )
+
+    return(invisible(NULL))
+  }
+
+
+  # Limit to 50 proteins ranked by minimum FDR
+  if (length(proteins) > 50) {
+
+    min_fdr <- sapply(
+      proteins,
+      function(protein) {
+
+        min(
+          sapply(
+            results_list,
+            function(results) {
+
+              if (
+                protein %in%
+                rownames(results)
+              ) {
+
+                results[
+                  protein,
+                  "adj.P.Val"
+                ]
+
+              } else {
+
+                1
+              }
+            }
+          )
+        )
+      }
+    )
+
+    proteins <- names(
+      sort(min_fdr)
+    )[1:50]
+
+    cat(
+      "Limiting to top 50 proteins\n"
+    )
+  }
+
+
+  # Expression matrix
+  hm <- expr_mat[
+    proteins,
+    ,
+    drop = FALSE
+  ]
+
+
+  # Row z-score
+  hm_z <- t(
+    scale(
+      t(hm)
+    )
+  )
+
+  hm_z <- pmin(
+    pmax(hm_z, -2),
+    2
+  )
+
+
+  # Order samples by condition
+  col_order <- order(
+    samples_df$Condition
+  )
+
+
+  col_ann <- data.frame(
+    Condition = samples_df$Condition[col_order],
+    Donor = samples_df$Donor[col_order],
+    row.names = samples_df$Sample_code[col_order]
+  )
+
+
+  # Determine which contrasts each protein is significant in
+  row_ann <- as.data.frame(
+    sapply(
+      results_list,
+      function(results) {
+
+        significant <- rownames(
+          results[
+            results$Direction !=
+              "Not significant",
+          ,
+            drop = FALSE
+          ]
+        )
+
+        ifelse(
+          proteins %in% significant,
+          "Yes",
+          "No"
+        )
+      }
+    ),
+    stringsAsFactors = FALSE
+  )
+
+  colnames(row_ann) <- contrast_names
+  rownames(row_ann) <- proteins
+
+
+  # Donor colours
+  donor_levels <- levels(
+    samples_df$Donor
+  )
+
+  donor_colours <- setNames(
+    brewer.pal(
+      max(3, length(donor_levels)),
+      "Set2"
+    )[seq_along(donor_levels)],
+    donor_levels
+  )
+
+
+  annotation_colours <- list(
+    Condition = colours,
+    Donor = donor_colours
+  )
+
+
+  for (contrast in contrast_names) {
+
+    annotation_colours[[contrast]] <- c(
+      Yes = "#E53935",
+      No = "grey90"
+    )
+  }
+
+
+  ph <- pheatmap(
+    hm_z[, col_order],
+    annotation_col = col_ann,
+    annotation_row = row_ann,
+    annotation_colors = annotation_colours,
+    cluster_cols = FALSE,
+    cluster_rows = TRUE,
+    show_rownames = TRUE,
+    show_colnames = FALSE,
+    fontsize_row = 6,
+    fontsize = 9,
+    color = colorRampPalette(
+      c(
+        "#2166AC",
+        "white",
+        "#B2182B"
+      )
+    )(100),
+    breaks = seq(
+      -2,
+      2,
+      length.out = 101
+    ),
+    border_color = NA,
+    main = title,
+    silent = TRUE
+  )
+
+
+  print(ph)
+
+  pdf(
+    filename,
+    width = 12,
+    height = max(
+      7,
+      length(proteins) * 0.22
+    )
+  )
+
+  print(ph)
+  dev.off()
+
+  cat(
+    "Saved:",
+    filename,
+    "\n"
+  )
+}
+
+# 22. CATEGORY HEATMAPS - for each contrast 
+make_category_heatmap(
+  proteins = shared,
+  expr_mat = expr_final,
+  samples_df = samples_f,
+  results_list = results_list,
+  contrast_names = contrast_labels,
+  colours = condition_colours,
+  title = paste0(
+    "IPF — Disease & drug-responsive proteins (n=",
+    length(shared),
+    ")\n",
+    "Significant in baseline AND ≥1 drug contrast"
+  ),
+  filename = "P2/P2_Heatmap_shared_proteins.pdf"
+)
+
+
+make_category_heatmap(
+  proteins = baseline_only,
+  expr_mat = expr_final,
+  samples_df = samples_f,
+  results_list = results_list,
+  contrast_names = contrast_labels,
+  colours = condition_colours,
+  title = paste0(
+    "IPF — Disease-only proteins (n=",
+    length(baseline_only),
+    ")\n",
+    "Significant in baseline only"
+  ),
+  filename = "P2/P2_Heatmap_baseline_only.pdf"
+)
+
+
+make_category_heatmap(
+  proteins = drug_only,
+  expr_mat = expr_final,
+  samples_df = samples_f,
+  results_list = results_list,
+  contrast_names = contrast_labels,
+  colours = condition_colours,
+  title = paste0(
+    "IPF — Drug-specific proteins (n=",
+    length(drug_only),
+    ")\n",
+    "Significant in drug contrast only"
+  ),
+  filename = "P2/P2_Heatmap_drug_only.pdf"
+)
+
+
+# 23. TOP 500 MOST VARIABLE PROTEINS — PCA - secondary ref 
+
+top500 <- order(
+  rowVars(
+    as.matrix(expr_final)
+  ),
+  decreasing = TRUE
+)[
+  1:min(
+    500,
+    nrow(expr_final)
+  )
+]
+
+
+pca_top500 <- prcomp(
+  t(
+    expr_final[
+      top500,
+      ,
+      drop = FALSE
+    ]
+  ),
+  scale. = TRUE
+)
+
+pca_top500_variance <- round(
+  100 *
+    pca_top500$sdev^2 /
+    sum(pca_top500$sdev^2),
+  1
+)
+
+
+pca_top500_df <- data.frame(
+  PC1 = pca_top500$x[, 1],
+  PC2 = pca_top500$x[, 2],
+  Condition = samples_f$Condition,
+  Donor = samples_f$Donor,
+  Sample = samples_f$Sample_code
+)
+
+
+# Day 7 conditions only
+pca_top500_day7 <- pca_top500_df %>%
+  filter(
+    Condition != "day0_SF"
+  ) %>%
+  mutate(
+    Condition = droplevels(Condition)
+  )
+
+
+# Centroids
+centroids_top500 <- pca_top500_day7 %>%
+  group_by(Condition) %>%
+  summarise(
+    PC1 = mean(PC1),
+    PC2 = mean(PC2),
+    .groups = "drop"
+  )
+
+
+get_top500_centroid <- function(
+    condition
+) {
+
+  centroids_top500 %>%
+    filter(
+      Condition == condition
+    )
+}
+
+
+# Treatment arrows
+arrow_top500 <- bind_rows(
+
+  data.frame(
+    x = get_top500_centroid(
+      "day7_DMSO"
+    )$PC1,
+
+    y = get_top500_centroid(
+      "day7_DMSO"
+    )$PC2,
+
+    xend = get_top500_centroid(
+      "day7_Nin"
+    )$PC1,
+
+    yend = get_top500_centroid(
+      "day7_Nin"
+    )$PC2
+  ),
+
+  data.frame(
+    x = get_top500_centroid(
+      "day7_DMSO"
+    )$PC1,
+
+    y = get_top500_centroid(
+      "day7_DMSO"
+    )$PC2,
+
+    xend = get_top500_centroid(
+      "day7_Senic"
+    )$PC1,
+
+    yend = get_top500_centroid(
+      "day7_Senic"
+    )$PC2
+  )
+)
+
+
+p_top500 <- ggplot(
+  pca_top500_day7,
+  aes(
+    PC1,
+    PC2,
+    colour = Condition
+  )
+) +
+
+  geom_point(
+    size = 4,
+    alpha = 0.85
+  ) +
+
+  stat_ellipse(
+    aes(group = Condition),
+    type = "norm",
+    linetype = "dashed",
+    linewidth = 0.5,
+    alpha = 0.7
+  ) +
+
+  geom_segment(
+    data = arrow_top500,
+    aes(
+      x = x,
+      y = y,
+      xend = xend,
+      yend = yend
+    ),
+    arrow = arrow(
+      length = unit(
+        0.18,
+        "cm"
+      ),
+      type = "closed"
+    ),
+    colour = "grey50",
+    linewidth = 0.4,
+    inherit.aes = FALSE
+  ) +
+
+  geom_label(
+    data = centroids_top500,
+    aes(
+      PC1,
+      PC2,
+      label = Condition,
+      colour = Condition
+    ),
+    size = 2.8,
+    fontface = "bold",
+    show.legend = FALSE,
+    fill = "white",
+    alpha = 0.7
+  ) +
+
+  scale_colour_manual(
+    values = day7_colours
+  ) +
+
+  theme_classic(
+    base_size = 13
+  ) +
+
+  labs(
+    title = "IPF — PCA top 500 most variable proteins",
+    subtitle = "Variance calculated blind to condition labels — exploratory",
+    x = paste0(
+      "PC1 (",
+      pca_top500_variance[1],
+      "%)"
+    ),
+    y = paste0(
+      "PC2 (",
+      pca_top500_variance[2],
+      "%)"
+    )
+  )
+
+
+print(p_top500)
+
+ggsave(
+  "P2/P2_PCA_top500_day7only.pdf",
+  p_top500,
+  width = 8,
+  height = 7
+)
+
+# 24. COMBINE PCA FIGURES
+
+combined_pca <- p_full_pca +
+  p_top500 +
+  plot_annotation(
+    title = "IPF — PCA comparison",
+    caption = paste0(
+      "Left: full denoised proteome (",
+      nrow(expr_final),
+      " proteins).\n",
+      "Right: top 500 most variable proteins.\n",
+      "day0_SF excluded from visualisation; included in denoising matrix."
+    ),
+    theme = theme(
+      plot.title = element_text(
+        face = "bold",
+        hjust = 0.5,
+        size = 13
+      ),
+      plot.caption = element_text(
+        colour = "grey40",
+        size = 8
+      )
+    )
+  )
+
+
+print(combined_pca)
+
+ggsave(
+  "P2/P2_PCA_combined.pdf",
+  combined_pca,
+  width = 15,
+  height = 7
+)
+
+#######################
+# PIPELINE COMPLETE
+
+cat("\n========================================\n")
+cat("=== PIPELINE 2 COMPLETE ===\n")
+cat("========================================\n")
+
+cat("Results:\n")
+cat("  P2_Baseline_all_proteins.csv\n")
+cat("  P2_Baseline_FDR_significant.csv\n")
+cat("  P2_Baseline_top20_FC.csv\n")
+cat("  P2_Nintedanib_all_proteins.csv\n")
+cat("  P2_Nintedanib_FDR_significant.csv\n")
+cat("  P2_Nintedanib_top20_FC.csv\n")
+cat("  P2_Senicapoc_all_proteins.csv\n")
+cat("  P2_Senicapoc_FDR_significant.csv\n")
+cat("  P2_Senicapoc_top20_FC.csv\n")
+
+cat("\nFigures:\n")
+cat("  P2_PCA_fullproteome_day7only.pdf\n")
+cat("  P2_PCA_top500_day7only.pdf\n")
+cat("  P2_PCA_combined.pdf\n")
+cat("  P2_Volcano_Baseline.pdf\n")
+cat("  P2_Volcano_Nintedanib.pdf\n")
+cat("  P2_Volcano_Senicapoc.pdf\n")
+cat("  P2_Heatmap_all_contrasts.pdf\n")
+cat("  P2_Heatmap_Top50_Baseline.pdf\n")
+cat("  P2_Heatmap_shared_proteins.pdf\n")
+cat("  P2_Heatmap_baseline_only.pdf\n")
+cat("  P2_Heatmap_drug_only.pdf\n")
