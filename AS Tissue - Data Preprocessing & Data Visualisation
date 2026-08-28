@@ -1,1 +1,1745 @@
+# PIPELINE 3 — AORTIC STENOSIS (AS) DATASET
 
+# Three contrasts from one model:
+#   1. TGFB1_DMSO vs SF_DMSO_citric
+#      Baseline: TGF-B1 effect on AV tissue
+#   2. TGFB1_Nintedanib vs TGFB1_DMSO
+#      Nintedanib treatment effect
+#   3. TGFB1_Senicapoc vs TGFB1_DMSO
+#      Senicapoc treatment effect
+
+# All objects are prefixed P3_ to avoid conflicts with Pipeline 2.
+
+# IMPORTANT:
+# AS samples are single technical replicates!! not triplicates like IPF & healthy lung tissue
+# Each donor contributes ONLY ONE measurement per condition.
+
+# Consequences:
+#   - Imputed values carry higher uncertainty than replicated datasets.
+#   - ARSyNseq donor-effect estimates are based on single measurements.
+#   - Robust empirical Bayes moderation is used to reduce sensitivity to
+#     outlier variance.
+#   - Drug contrasts are exploratory.
+#   - Drug-contrast results are interpreted using nominal p < 0.05 because
+#     no proteins survive FDR correction.
+
+#NOTE: though fundamentally simailr, this pipeline includes a few key differences to
+      #account for limitations of this dataset!
+##############################################################
+
+setwd("/home/fap16/final_project")
+
+
+# STEP 0 - SET UP 
+
+#LIBRARIES & WORKING DIRECTORY
+
+library(readxl)
+library(tidyverse)
+library(matrixStats)
+library(limma)
+library(caret)
+library(NOISeq)
+library(ggplot2)
+library(ggrepel)
+library(pheatmap)
+library(RColorBrewer)
+library(patchwork)
+
+
+
+################################
+# STEP 1 — IMPORT & FILTER
+#
+# NOTE:
+# The sample-list sheet is named "SampeList" in the original file
+
+
+p3_samples_raw <- read_excel(
+  "AV_Tissue_SampleandProteinList_CM.xlsx",
+  sheet = "SampeList"
+)
+
+p3_proteins_raw <- read_excel(
+  "AV_Tissue_SampleandProteinList_CM.xlsx",
+  sheet = "ProteinList"
+)
+
+
+# Keep the four conditions used in Pipeline 3
+p3_samples <- p3_samples_raw %>%
+  filter(
+    Condition %in% c(
+      "SF_DMSO_citric",
+      "TGFB1_DMSO",
+      "TGFB1_Nintedanib",
+      "TGFB1_Senicapoc"
+    )
+  ) %>%
+  mutate(
+    Condition = factor(
+      Condition,
+      levels = c(
+        "SF_DMSO_citric",
+        "TGFB1_DMSO",
+        "TGFB1_Nintedanib",
+        "TGFB1_Senicapoc"
+      )
+    ),
+    Donor = factor(Donor)
+  )
+
+
+cat("\n=== P3 STEP 1 COMPLETE ===\n")
+cat("Samples retained:", nrow(p3_samples), "\n")
+cat("Design balance:\n")
+print(table(p3_samples$Condition, p3_samples$Donor))
+
+
+# Condition colours
+p3_colours <- c(
+  "SF_DMSO_citric"   = "#2196F3",
+  "TGFB1_DMSO"       = "#E53935",
+  "TGFB1_Nintedanib" = "#4CAF50",
+  "TGFB1_Senicapoc"  = "#FF9800"
+)
+
+
+################################
+# STEPS 2–7.5 — EXPRESSION MATRIX, FILTERING, IMPUTATION,
+#              NORMALISATION & DENOISING
+
+# STEP 2 — Build expression matrix
+
+
+p3_sample_names <- p3_samples$Sample
+
+p3_expr <- p3_proteins_raw %>%
+  select(all_of(p3_sample_names)) %>%
+  mutate(
+    across(everything(), ~ as.numeric(as.character(.)))
+  ) %>%
+  as.data.frame()
+
+rownames(p3_expr) <- make.unique(
+  as.character(p3_proteins_raw$PG.Genes)
+)
+
+stopifnot(
+  all(colnames(p3_expr) == p3_samples$Sample)
+)
+
+cat(
+  "Expression matrix:",
+  nrow(p3_expr),
+  "proteins x",
+  ncol(p3_expr),
+  "samples\n\n"
+)
+
+
+# STEP 3 — Completeness filtering
+
+p3_min_v <- ceiling(0.70 * ncol(p3_expr))
+
+p3_expr_c <- p3_expr[
+  apply(
+    p3_expr,
+    1,
+    function(x) sum(!is.na(x) & x > 0)
+  ) >= p3_min_v,
+]
+
+cat(
+  "After completeness filtering:",
+  nrow(p3_expr_c),
+  "proteins\n"
+)
+
+# STEP 4 — Imputation & log2 transformation 
+
+p3_expr_i <- p3_expr_c
+
+# Treat zero values as missing
+p3_expr_i[p3_expr_i == 0] <- NA
+
+# Column-wise minimum-based imputation
+for (j in seq_len(ncol(p3_expr_i))) {
+
+  p3_min_value <- min(
+    p3_expr_i[, j],
+    na.rm = TRUE
+  )
+
+  if (!is.finite(p3_min_value)) {
+    p3_min_value <- 1
+  }
+
+  p3_expr_i[
+    is.na(p3_expr_i[, j]),
+    j
+  ] <- p3_min_value / 5
+}
+
+# Log2 transform
+p3_expr_l <- log2(as.matrix(p3_expr_i))
+ 
+# STEP 5 — Median centring 
+
+p3_global_median <- median(p3_expr_l)
+
+p3_sample_medians <- apply(
+  p3_expr_l,
+  2,
+  median
+)
+
+p3_expr_n <- sweep(
+  p3_expr_l,
+  2,
+  p3_global_median - p3_sample_medians,
+  "+"
+)
+
+ 
+# STEP 6 — Abundance and variability filtering 
+
+# Abundance filter
+p3_expr_a <- p3_expr_n[
+  rowMeans(p3_expr_n) >
+    quantile(rowMeans(p3_expr_n), 0.40),
+]
+
+# MAD variability filter
+p3_mv <- rowMads(p3_expr_a)
+
+p3_expr_v <- p3_expr_a[
+  p3_mv > median(p3_mv),
+]
+
+
+# Remove near-zero-variance features
+p3_nzv <- nearZeroVar(t(p3_expr_v))
+
+if (length(p3_nzv) > 0) {
+  p3_expr_v <- p3_expr_v[-p3_nzv, , drop = FALSE]
+}
+
+cat(
+  "After abundance/variability filtering:",
+  nrow(p3_expr_v),
+  "proteins\n"
+)
+ 
+# STEP 7.5 — ARSyNseq donor-effect denoising 
+
+p3_factors <- data.frame(
+  Condition = p3_samples$Condition,
+  Donor     = p3_samples$Donor,
+  row.names = p3_samples$Sample
+)
+
+p3_nd <- readData(
+  data = as.data.frame(p3_expr_v),
+  factors = p3_factors
+)
+
+p3_den_obj <- ARSyNseq(
+  p3_nd,
+  factor = "Donor",
+  batch = TRUE,
+  norm = "n",
+  logtransf = TRUE
+)
+
+p3_expr_final <- as.matrix(
+  exprs(p3_den_obj)
+)
+
+p3_expr_final <- p3_expr_final[
+  ,
+  p3_samples$Sample,
+  drop = FALSE
+]
+
+
+cat("\n=== P3 STEP 7.5 COMPLETE ===\n")
+cat(
+  "Final matrix:",
+  nrow(p3_expr_final),
+  "proteins x",
+  ncol(p3_expr_final),
+  "samples\n\n"
+)
+
+
+
+################################
+## STEP 2 DIFFERENTIALLY EXPRESSION ANALYSIS 
+
+
+# STEP 8 — LIMMA: SINGLE MODEL, THREE CONTRASTS 
+
+p3_design <- model.matrix(
+  ~ 0 + Condition,
+  data = p3_samples
+)
+
+colnames(p3_design) <- levels(
+  p3_samples$Condition
+)
+
+p3_fit <- lmFit(
+  p3_expr_final,
+  p3_design
+)
+
+
+# Define all three contrasts
+p3_contrasts <- makeContrasts(
+  Baseline   = TGFB1_DMSO - SF_DMSO_citric,
+  Nintedanib = TGFB1_Nintedanib - TGFB1_DMSO,
+  Senicapoc  = TGFB1_Senicapoc - TGFB1_DMSO,
+  levels = p3_design
+)
+
+
+# Fit contrasts
+p3_fit2 <- contrasts.fit(
+  p3_fit,
+  p3_contrasts
+)
+
+# Robust empirical Bayes moderation
+p3_fit2 <- eBayes(
+  p3_fit2,
+  trend = TRUE,
+  robust = TRUE
+)
+ 
+# HELPER FUNCTION 1 — EXTRACT LIMMA RESULTS 
+
+p3_extract <- function(
+  fit2,
+  coef_name,
+  up_label,
+  down_label
+) {
+
+  res <- topTable(
+    fit2,
+    coef = coef_name,
+    number = Inf,
+    sort.by = "P"
+  ) %>%
+    mutate(
+      negLogP = -log10(P.Value),
+
+      Direction = case_when(
+        adj.P.Val < 0.1 & logFC > 0.58 ~ up_label,
+        adj.P.Val < 0.1 & logFC < -0.58 ~ down_label,
+        TRUE ~ "Not significant"
+      ),
+
+      Contrast = coef_name
+    )
+
+
+  cat(sprintf(
+    "\n=== P3 %s ===\n",
+    coef_name
+  ))
+
+  cat(
+    "Proteins tested:                     ",
+    nrow(res),
+    "\n"
+  )
+
+  cat(
+    "Raw p < 0.05:                        ",
+    sum(res$P.Value < 0.05),
+    "\n"
+  )
+
+  cat(
+    "FDR adj.P.Val < 0.1:                 ",
+    sum(res$adj.P.Val < 0.1),
+    "\n"
+  )
+
+  cat(
+    "FDR < 0.1 & |logFC| > 0.58 [SIG]:   ",
+    sum(
+      res$adj.P.Val < 0.1 &
+        abs(res$logFC) > 0.58
+    ),
+    "\n"
+  )
+
+  cat(
+    "  Up:   ",
+    sum(res$Direction == up_label),
+    "\n"
+  )
+
+  cat(
+    "  Down: ",
+    sum(res$Direction == down_label),
+    "\n\n"
+  )
+
+
+  return(res)
+}
+
+ 
+# HELPER FUNCTION 2 — EXPORT RESULTS 
+
+p3_export <- function(
+  results,
+  contrast_name,
+  up_label,
+  down_label
+) {
+
+  # All proteins
+  write.csv(
+    results,
+    paste0(
+      "P3_",
+      contrast_name,
+      "_all_proteins.csv"
+    ),
+    row.names = TRUE
+  )
+
+
+  # FDR-significant proteins
+  sig <- results %>%
+    filter(
+      adj.P.Val < 0.1,
+      abs(logFC) > 0.58
+    ) %>%
+    arrange(adj.P.Val) %>%
+    select(
+      logFC,
+      AveExpr,
+      t,
+      P.Value,
+      adj.P.Val,
+      negLogP,
+      Direction
+    )
+
+
+  write.csv(
+    sig,
+    paste0(
+      "P3_",
+      contrast_name,
+      "_FDR_significant.csv"
+    ),
+    row.names = TRUE
+  )
+
+
+  # Top 10 upregulated
+  top_up <- results %>%
+    filter(
+      adj.P.Val < 0.1,
+      logFC > 0.58
+    ) %>%
+    arrange(desc(logFC)) %>%
+    slice_head(n = 10) %>%
+    mutate(
+      FoldChange = round(2^logFC, 3),
+      logFC      = round(logFC, 3),
+      P.Value    = signif(P.Value, 3),
+      adj.P.Val  = signif(adj.P.Val, 3)
+    ) %>%
+    select(
+      logFC,
+      FoldChange,
+      P.Value,
+      adj.P.Val,
+      Direction
+    )
+
+
+  # Top 10 downregulated
+  top_down <- results %>%
+    filter(
+      adj.P.Val < 0.1,
+      logFC < -0.58
+    ) %>%
+    arrange(logFC) %>%
+    slice_head(n = 10) %>%
+    mutate(
+      FoldChange = round(2^logFC, 3),
+      logFC      = round(logFC, 3),
+      P.Value    = signif(P.Value, 3),
+      adj.P.Val  = signif(adj.P.Val, 3)
+    ) %>%
+    select(
+      logFC,
+      FoldChange,
+      P.Value,
+      adj.P.Val,
+      Direction
+    )
+
+
+  # Combine top up/down proteins
+  write.csv(
+    bind_rows(top_up, top_down),
+    paste0(
+      "P3_",
+      contrast_name,
+      "_top20_FC.csv"
+    ),
+    row.names = TRUE
+  )
+
+
+  cat(sprintf(
+    "Saved: P3_%s | FDR sig: %d | Up: %d | Down: %d\n\n",
+    contrast_name,
+    nrow(sig),
+    sum(sig$Direction == up_label),
+    sum(sig$Direction == down_label)
+  ))
+
+
+  return(sig)
+}
+ 
+# STEP 9 — EXTRACT RESULTS 
+
+p3_results_baseline <- p3_extract(
+  p3_fit2,
+  "Baseline",
+  "Up in TGFB1_DMSO",
+  "Down in TGFB1_DMSO"
+)
+
+p3_results_nintedanib <- p3_extract(
+  p3_fit2,
+  "Nintedanib",
+  "Up in TGFB1_Nintedanib",
+  "Down in TGFB1_Nintedanib"
+)
+
+p3_results_senicapoc <- p3_extract(
+  p3_fit2,
+  "Senicapoc",
+  "Up in TGFB1_Senicapoc",
+  "Down in TGFB1_Senicapoc"
+)
+ 
+# STEP 10 — EXPORT RESULTS 
+
+p3_sig_baseline <- p3_export(
+  p3_results_baseline,
+  "Baseline",
+  "Up in TGFB1_DMSO",
+  "Down in TGFB1_DMSO"
+)
+
+p3_sig_nintedanib <- p3_export(
+  p3_results_nintedanib,
+  "Nintedanib",
+  "Up in TGFB1_Nintedanib",
+  "Down in TGFB1_Nintedanib"
+)
+
+p3_sig_senicapoc <- p3_export(
+  p3_results_senicapoc,
+  "Senicapoc",
+  "Up in TGFB1_Senicapoc",
+  "Down in TGFB1_Senicapoc"
+)
+
+
+################################
+#STEP 3 DATA VISUALISATION 
+
+
+################################
+
+# STEP 11 — PCA: FULL DENOISED PROTEOME 
+
+p3_pca <- prcomp(
+  t(p3_expr_final),
+  scale. = TRUE
+)
+
+p3_pv <- round(
+  100 *
+    p3_pca$sdev^2 /
+    sum(p3_pca$sdev^2),
+  1
+)
+
+
+p3_pca_df <- data.frame(
+  PC1       = p3_pca$x[, 1],
+  PC2       = p3_pca$x[, 2],
+  Condition = p3_samples$Condition,
+  Donor     = p3_samples$Donor,
+  Sample    = p3_samples$Sample
+)
+
+
+# Condition centroids
+p3_centroids <- p3_pca_df %>%
+  group_by(Condition) %>%
+  summarise(
+    PC1 = mean(PC1),
+    PC2 = mean(PC2),
+    .groups = "drop"
+  )
+
+
+get_p3c <- function(cond) {
+  p3_centroids %>%
+    filter(Condition == cond)
+}
+
+
+# Treatment trajectory arrows
+p3_arrow_df <- bind_rows(
+
+  # TGF-B1 effect
+  data.frame(
+    x    = get_p3c("SF_DMSO_citric")$PC1,
+    y    = get_p3c("SF_DMSO_citric")$PC2,
+    xend = get_p3c("TGFB1_DMSO")$PC1,
+    yend = get_p3c("TGFB1_DMSO")$PC2,
+    label = "TGF-B1 effect"
+  ),
+
+  # Nintedanib effect
+  data.frame(
+    x    = get_p3c("TGFB1_DMSO")$PC1,
+    y    = get_p3c("TGFB1_DMSO")$PC2,
+    xend = get_p3c("TGFB1_Nintedanib")$PC1,
+    yend = get_p3c("TGFB1_Nintedanib")$PC2,
+    label = "Nintedanib"
+  ),
+
+  # Senicapoc effect
+  data.frame(
+    x    = get_p3c("TGFB1_DMSO")$PC1,
+    y    = get_p3c("TGFB1_DMSO")$PC2,
+    xend = get_p3c("TGFB1_Senicapoc")$PC1,
+    yend = get_p3c("TGFB1_Senicapoc")$PC2,
+    label = "Senicapoc"
+  )
+)
+
+
+p3_pca_plot <- ggplot(
+  p3_pca_df,
+  aes(PC1, PC2, colour = Condition)
+) +
+
+  geom_point(
+    size = 4,
+    alpha = 0.85
+  ) +
+
+  geom_segment(
+    data = p3_arrow_df,
+    aes(
+      x = x,
+      y = y,
+      xend = xend,
+      yend = yend
+    ),
+    arrow = arrow(
+      length = unit(0.25, "cm"),
+      type = "closed"
+    ),
+    colour = "grey40",
+    linewidth = 0.8,
+    inherit.aes = FALSE
+  ) +
+
+  geom_label(
+    data = p3_centroids,
+    aes(
+      PC1,
+      PC2,
+      label = Condition,
+      colour = Condition
+    ),
+    size = 2.8,
+    fontface = "bold",
+    show.legend = FALSE,
+    fill = "white",
+    alpha = 0.7
+  ) +
+
+  stat_ellipse(
+    aes(group = Condition),
+    type = "norm",
+    linetype = "dashed",
+    linewidth = 0.5,
+    fill = NA
+  ) +
+
+  scale_colour_manual(
+    values = p3_colours
+  ) +
+
+  theme_classic(
+    base_size = 13
+  ) +
+
+  labs(
+    title = "Aortic Stenosis PCA — Full Denoised Proteome",
+    subtitle = paste(
+      "Arrows show proteome movement between conditions:",
+      "treatment trajectories"
+    ),
+    x = paste0(
+      "PC1 (",
+      p3_pv[1],
+      "%)"
+    ),
+    y = paste0(
+      "PC2 (",
+      p3_pv[2],
+      "%)"
+    )
+  )
+
+
+print(p3_pca_plot)
+
+ggsave(
+  "P3_PCA_trajectories.pdf",
+  p3_pca_plot,
+  width = 8,
+  height = 7
+)
+
+
+################################
+# STEP 12 — VOLCANO PLOTS
+
+p3_volcano <- function(
+  results,
+  title_str,
+  up_col,
+  down_col,
+  filename
+) {
+
+  # Determine FDR threshold line
+  if (any(results$adj.P.Val < 0.1)) {
+
+    fdr_line <- -log10(
+      max(
+        results$P.Value[
+          results$adj.P.Val < 0.1
+        ]
+      )
+    )
+
+  } else {
+
+    fdr_line <- -log10(0.05)
+  }
+
+
+  # Label top significant proteins
+  top_lab <- results %>%
+    filter(
+      Direction != "Not significant"
+    ) %>%
+    arrange(P.Value) %>%
+    slice_head(n = 15) %>%
+    rownames()
+
+
+  results <- results %>%
+    mutate(
+      Label = ifelse(
+        rownames(results) %in% top_lab,
+        rownames(results),
+        NA
+      )
+    )
+
+
+  # Build colour mapping
+  dir_levels <- unique(
+    results$Direction[
+      results$Direction != "Not significant"
+    ]
+  )
+
+  colour_vals <- c(
+    setNames(
+      c(up_col, down_col)[
+        seq_along(dir_levels)
+      ],
+      dir_levels
+    ),
+    "Not significant" = "grey70"
+  )
+
+
+  p <- ggplot(
+    results,
+    aes(
+      logFC,
+      negLogP,
+      colour = Direction
+    )
+  ) +
+
+    geom_point(
+      alpha = 0.6,
+      size = 1.8
+    ) +
+
+    geom_hline(
+      yintercept = fdr_line,
+      linetype = "dashed",
+      colour = "grey30",
+      linewidth = 0.7
+    ) +
+
+    geom_hline(
+      yintercept = -log10(0.05),
+      linetype = "dotted",
+      colour = "steelblue",
+      linewidth = 0.7
+    ) +
+
+    geom_vline(
+      xintercept = c(-0.58, 0.58),
+      linetype = "dashed",
+      colour = "grey30",
+      linewidth = 0.7
+    ) +
+
+    scale_colour_manual(
+      values = colour_vals
+    ) +
+
+    geom_text_repel(
+      aes(label = Label),
+      size = 2.8,
+      max.overlaps = 20,
+      box.padding = 0.4,
+      colour = "black",
+      show.legend = FALSE
+    ) +
+
+    annotate(
+      "text",
+      x = Inf,
+      y = fdr_line + 0.1,
+      label = "FDR = 0.1",
+      hjust = 1.1,
+      size = 3.2,
+      colour = "grey30"
+    ) +
+
+    annotate(
+      "text",
+      x = Inf,
+      y = -log10(0.05) + 0.1,
+      label = "p = 0.05",
+      hjust = 1.1,
+      size = 3.2,
+      colour = "steelblue"
+    ) +
+
+    theme_classic(
+      base_size = 13
+    ) +
+
+    labs(
+      title = title_str,
+      subtitle = "FDR < 0.1 & |logFC| > 0.58 coloured",
+      x = expression(log[2] ~ "FC"),
+      y = expression(-log[10] ~ "(p)"),
+      colour = NULL
+    ) +
+
+    theme(
+      legend.position = "bottom"
+    )
+
+
+  print(p)
+
+  ggsave(
+    filename,
+    p,
+    width = 7.5,
+    height = 6.5
+  )
+}
+
+
+# Baseline
+p3_volcano(
+  p3_results_baseline,
+  "Volcano: TGFB1_DMSO vs SF_DMSO_citric (AV baseline)",
+  "#E53935",
+  "#2196F3",
+  "P3_Volcano_Baseline.pdf"
+)
+
+
+# Nintedanib
+p3_volcano(
+  p3_results_nintedanib,
+  "Volcano: Nintedanib vs TGFB1_DMSO (AV)",
+  "#4CAF50",
+  "#9C27B0",
+  "P3_Volcano_Nintedanib.pdf"
+)
+
+
+# Senicapoc
+p3_volcano(
+  p3_results_senicapoc,
+  "Volcano: Senicapoc vs TGFB1_DMSO (AV)",
+  "#FF9800",
+  "#9C27B0",
+  "P3_Volcano_Senicapoc.pdf"
+)
+
+
+################################
+# STEP 13 — HEATMAP: UNION OF FDR-SIGNIFICANT PROTEINS 
+
+p3_sig_union <- unique(
+  c(
+    rownames(p3_sig_baseline),
+    rownames(p3_sig_nintedanib),
+    rownames(p3_sig_senicapoc)
+  )
+)
+
+cat(
+  "P3 significant proteins (union):",
+  length(p3_sig_union),
+  "\n"
+)
+
+
+if (length(p3_sig_union) >= 2) {
+
+  # Limit to top 100 proteins if necessary
+  if (length(p3_sig_union) > 100) {
+
+    p3_min_adjp <- sapply(
+      p3_sig_union,
+      function(prot) {
+
+        min(
+          if (
+            prot %in%
+            rownames(p3_results_baseline)
+          ) {
+            p3_results_baseline[
+              prot,
+              "adj.P.Val"
+            ]
+          } else {
+            1
+          },
+
+          if (
+            prot %in%
+            rownames(p3_results_nintedanib)
+          ) {
+            p3_results_nintedanib[
+              prot,
+              "adj.P.Val"
+            ]
+          } else {
+            1
+          },
+
+          if (
+            prot %in%
+            rownames(p3_results_senicapoc)
+          ) {
+            p3_results_senicapoc[
+              prot,
+              "adj.P.Val"
+            ]
+          } else {
+            1
+          }
+        )
+      }
+    )
+
+
+    p3_plot_proteins <- names(
+      sort(p3_min_adjp)
+    )[1:100]
+
+    cat(
+      "Showing top 100 most significant proteins\n"
+    )
+
+  } else {
+
+    p3_plot_proteins <- p3_sig_union
+  }
+
+
+  # Heatmap matrix
+  p3_hm <- p3_expr_final[
+    p3_plot_proteins,
+    ,
+    drop = FALSE
+  ]
+
+  p3_hm_z <- pmin(
+    pmax(
+      t(scale(t(p3_hm))),
+      -2
+    ),
+    2
+  )
+
+
+  # Column ordering
+  p3_col_ord <- order(
+    p3_samples$Condition
+  )
+
+
+  # Column annotations
+  p3_col_ann <- data.frame(
+    Condition = p3_samples$Condition[
+      p3_col_ord
+    ],
+    Donor = p3_samples$Donor[
+      p3_col_ord
+    ],
+    row.names = p3_samples$Sample[
+      p3_col_ord
+    ]
+  )
+
+
+  # Row annotations
+  p3_row_ann <- data.frame(
+    Baseline = ifelse(
+      p3_plot_proteins %in%
+        rownames(p3_sig_baseline),
+      "Yes",
+      "No"
+    ),
+
+    Nintedanib = ifelse(
+      p3_plot_proteins %in%
+        rownames(p3_sig_nintedanib),
+      "Yes",
+      "No"
+    ),
+
+    Senicapoc = ifelse(
+      p3_plot_proteins %in%
+        rownames(p3_sig_senicapoc),
+      "Yes",
+      "No"
+    ),
+
+    row.names = p3_plot_proteins
+  )
+
+
+  # Donor annotation colours
+  p3_donor_colours <- setNames(
+    brewer.pal(
+      max(
+        3,
+        length(
+          levels(p3_samples$Donor)
+        )
+      ),
+      "Set2"
+    ),
+    levels(p3_samples$Donor)
+  )
+
+
+  p3_ph <- pheatmap(
+    p3_hm_z[
+      ,
+      p3_col_ord,
+      drop = FALSE
+    ],
+
+    annotation_col = p3_col_ann,
+
+    annotation_row = p3_row_ann,
+
+    annotation_colors = list(
+      Condition = p3_colours,
+
+      Donor = p3_donor_colours,
+
+      Baseline = c(
+        "Yes" = "#E53935",
+        "No" = "grey90"
+      ),
+
+      Nintedanib = c(
+        "Yes" = "#4CAF50",
+        "No" = "grey90"
+      ),
+
+      Senicapoc = c(
+        "Yes" = "#FF9800",
+        "No" = "grey90"
+      )
+    ),
+
+    cluster_cols = FALSE,
+    cluster_rows = TRUE,
+
+    show_rownames = TRUE,
+    show_colnames = FALSE,
+
+    fontsize_row = 6,
+
+    color = colorRampPalette(
+      c(
+        "#2166AC",
+        "white",
+        "#B2182B"
+      )
+    )(100),
+
+    breaks = seq(
+      -2,
+      2,
+      length.out = 101
+    ),
+
+    border_color = NA,
+
+    main = paste0(
+      "AV — FDR significant proteins (n=",
+      length(p3_plot_proteins),
+      ")\n",
+      "adj.P < 0.1 & |log2FC| > 0.58"
+    ),
+
+    fontsize = 9,
+    silent = TRUE
+  )
+
+
+  print(p3_ph)
+
+
+  pdf(
+    "P3_Heatmap_all_contrasts.pdf",
+    width = 12,
+    height = max(
+      8,
+      length(p3_plot_proteins) * 0.22
+    )
+  )
+
+  print(p3_ph)
+
+  dev.off()
+
+
+  cat(
+    "Saved: P3_Heatmap_all_contrasts.pdf\n"
+  )
+
+} else {
+
+  cat(
+    "< 2 significant proteins — heatmap skipped\n"
+  )
+}
+
+################################
+# STEP 14 — BASELINE HEATMAP ACROSS ALL FOUR CONDITIONS 
+
+p3_hm_proteins <- rownames(
+  p3_sig_baseline
+)
+
+
+# Limit to top 50 baseline proteins
+if (length(p3_hm_proteins) > 50) {
+
+  p3_hm_proteins <- p3_results_baseline %>%
+    filter(
+      rownames(.) %in% p3_hm_proteins
+    ) %>%
+    arrange(adj.P.Val) %>%
+    slice_head(n = 50) %>%
+    rownames()
+}
+
+
+p3_hm <- p3_expr_final[
+  p3_hm_proteins,
+  ,
+  drop = FALSE
+]
+
+p3_hm_z <- pmin(
+  pmax(
+    t(scale(t(p3_hm))),
+    -2
+  ),
+  2
+)
+
+
+# Order:
+# SF_DMSO_citric → TGFB1_DMSO → Nintedanib → Senicapoc
+p3_col_ord <- order(
+  p3_samples$Condition
+)
+
+
+p3_col_ann <- data.frame(
+  Condition = p3_samples$Condition[
+    p3_col_ord
+  ],
+  Donor = p3_samples$Donor[
+    p3_col_ord
+  ],
+  row.names = p3_samples$Sample[
+    p3_col_ord
+  ]
+)
+
+
+p3_ph_baseline <- pheatmap(
+  p3_hm_z[
+    ,
+    p3_col_ord,
+    drop = FALSE
+  ],
+
+  annotation_col = p3_col_ann,
+
+  annotation_colors = list(
+    Condition = p3_colours,
+
+    Donor = setNames(
+      brewer.pal(
+        max(
+          3,
+          length(
+            levels(p3_samples$Donor)
+          )
+        ),
+        "Set2"
+      ),
+      levels(p3_samples$Donor)
+    )
+  ),
+
+  cluster_cols = FALSE,
+  cluster_rows = TRUE,
+
+  show_rownames = TRUE,
+  show_colnames = FALSE,
+
+  fontsize_row = 6,
+
+  color = colorRampPalette(
+    c(
+      "#2166AC",
+      "white",
+      "#B2182B"
+    )
+  )(100),
+
+  breaks = seq(
+    -2,
+    2,
+    length.out = 101
+  ),
+
+  border_color = NA,
+
+  main = paste0(
+    "AV — TGFβ1-driven proteins (n=",
+    length(p3_hm_proteins),
+    ")\n",
+    "FDR < 0.1 & |log2FC| > 0.58 | All conditions shown"
+  ),
+
+  fontsize = 9,
+  silent = TRUE
+)
+
+
+print(p3_ph_baseline)
+
+
+pdf(
+  "P3_Heatmap_baseline_all_conditions.pdf",
+  width = 14,
+  height = max(
+    8,
+    length(p3_hm_proteins) * 0.22
+  )
+)
+
+print(p3_ph_baseline)
+
+dev.off()
+
+
+################################
+# STEP 15 — DRUG EFFECTS: NOMINAL TOP HITS
+#
+# Exploratory only:
+# p < 0.05 and |logFC| > 0.58.
+# These results are NOT FDR corrected - J to evaluate signals
+ 
+p3_nin_top <- p3_results_nintedanib %>%
+  filter(
+    P.Value < 0.05,
+    abs(logFC) > 0.58
+  ) %>%
+  arrange(P.Value) %>%
+  slice_head(n = 20) %>%
+  mutate(
+    Drug = "Nintedanib",
+    Protein = rownames(.)
+  )
+
+
+p3_sen_top <- p3_results_senicapoc %>%
+  filter(
+    P.Value < 0.05,
+    abs(logFC) > 0.58
+  ) %>%
+  arrange(P.Value) %>%
+  slice_head(n = 20) %>%
+  mutate(
+    Drug = "Senicapoc",
+    Protein = rownames(.)
+  )
+
+
+p3_drug_df <- bind_rows(
+  p3_nin_top,
+  p3_sen_top
+) %>%
+  mutate(
+    Direction = ifelse(
+      logFC > 0,
+      "Up",
+      "Down"
+    ),
+
+    Protein = factor(
+      Protein,
+      levels = unique(
+        Protein[
+          order(
+            abs(logFC),
+            decreasing = TRUE
+          )
+        ]
+      )
+    )
+  )
+
+
+if (nrow(p3_drug_df) > 0) {
+
+  p3_bar <- ggplot(
+    p3_drug_df,
+    aes(
+      x = reorder(Protein, logFC),
+      y = logFC,
+      fill = Direction
+    )
+  ) +
+
+    geom_col() +
+
+    geom_hline(
+      yintercept = c(-0.58, 0.58),
+      linetype = "dashed",
+      colour = "grey40",
+      linewidth = 0.5
+    ) +
+
+    coord_flip() +
+
+    facet_wrap(
+      ~ Drug,
+      scales = "free_y"
+    ) +
+
+    scale_fill_manual(
+      values = c(
+        "Up" = "#E53935",
+        "Down" = "#2196F3"
+      )
+    ) +
+
+    theme_classic(
+      base_size = 11
+    ) +
+
+    labs(
+      title = "AV — Drug effects: top nominal hits",
+      subtitle = paste(
+        "p < 0.05, not FDR corrected.",
+        "No proteins survive FDR < 0.1."
+      ),
+      x = NULL,
+      y = expression(
+        log[2] ~
+          "Fold Change vs TGFB1_DMSO"
+      ),
+      fill = NULL
+    ) +
+
+    theme(
+      legend.position = "bottom",
+      strip.text = element_text(
+        face = "bold",
+        size = 11
+      )
+    )
+
+
+  print(p3_bar)
+
+
+  ggsave(
+    "P3_DrugEffects_nominal_barchart.pdf",
+    p3_bar,
+    width = 12,
+    height = 8
+  )
+
+
+  cat(
+    "Saved: P3_DrugEffects_nominal_barchart.pdf\n"
+  )
+
+} else {
+
+  cat(
+    "No nominal drug hits to plot\n"
+  )
+}
+
+
+
+# STEP 16 — PCA: TOP 500 MOST VARIABLE PROTEINS
+#
+# Variance is calculated blind to condition labels.
+
+p3_top500 <- order(
+  rowVars(
+    as.matrix(p3_expr_final)
+  ),
+  decreasing = TRUE
+)[
+  1:min(
+    500,
+    nrow(p3_expr_final)
+  )
+]
+
+
+p3_pca_top500 <- prcomp(
+  t(
+    p3_expr_final[
+      p3_top500,
+      ,
+      drop = FALSE
+    ]
+  ),
+  scale. = TRUE
+)
+
+
+p3_pv_top500 <- round(
+  100 *
+    p3_pca_top500$sdev^2 /
+    sum(
+      p3_pca_top500$sdev^2
+    ),
+  1
+)
+
+
+p3_pca_df_top500 <- data.frame(
+  PC1 = p3_pca_top500$x[, 1],
+  PC2 = p3_pca_top500$x[, 2],
+  Condition = p3_samples$Condition,
+  Donor = p3_samples$Donor
+)
+
+
+p3_centroids_top500 <- p3_pca_df_top500 %>%
+  group_by(Condition) %>%
+  summarise(
+    PC1 = mean(PC1),
+    PC2 = mean(PC2),
+    .groups = "drop"
+  )
+
+
+get_p3_centroid <- function(cond) {
+
+  p3_centroids_top500 %>%
+    filter(Condition == cond)
+}
+
+
+# Treatment arrows
+p3_arrow_df_top500 <- bind_rows(
+
+  # TGF-B1 effect
+  data.frame(
+    x = get_p3_centroid(
+      "SF_DMSO_citric"
+    )$PC1,
+
+    y = get_p3_centroid(
+      "SF_DMSO_citric"
+    )$PC2,
+
+    xend = get_p3_centroid(
+      "TGFB1_DMSO"
+    )$PC1,
+
+    yend = get_p3_centroid(
+      "TGFB1_DMSO"
+    )$PC2
+  ),
+
+  # Nintedanib
+  data.frame(
+    x = get_p3_centroid(
+      "TGFB1_DMSO"
+    )$PC1,
+
+    y = get_p3_centroid(
+      "TGFB1_DMSO"
+    )$PC2,
+
+    xend = get_p3_centroid(
+      "TGFB1_Nintedanib"
+    )$PC1,
+
+    yend = get_p3_centroid(
+      "TGFB1_Nintedanib"
+    )$PC2
+  ),
+
+  # Senicapoc
+  data.frame(
+    x = get_p3_centroid(
+      "TGFB1_DMSO"
+    )$PC1,
+
+    y = get_p3_centroid(
+      "TGFB1_DMSO"
+    )$PC2,
+
+    xend = get_p3_centroid(
+      "TGFB1_Senicapoc"
+    )$PC1,
+
+    yend = get_p3_centroid(
+      "TGFB1_Senicapoc"
+    )$PC2
+  )
+)
+
+
+p3_pca_top500_plot <- ggplot(
+  p3_pca_df_top500,
+  aes(
+    PC1,
+    PC2,
+    colour = Condition
+  )
+) +
+
+  geom_point(
+    size = 4,
+    alpha = 0.85
+  ) +
+
+  stat_ellipse(
+    aes(group = Condition),
+    type = "norm",
+    linetype = "dashed",
+    linewidth = 0.5,
+    alpha = 0.7
+  ) +
+
+  geom_segment(
+    data = p3_arrow_df_top500,
+    aes(
+      x = x,
+      y = y,
+      xend = xend,
+      yend = yend
+    ),
+    arrow = arrow(
+      length = unit(0.18, "cm"),
+      type = "closed"
+    ),
+    colour = "grey50",
+    linewidth = 0.4,
+    inherit.aes = FALSE
+  ) +
+
+  geom_label(
+    data = p3_centroids_top500,
+    aes(
+      PC1,
+      PC2,
+      label = Condition,
+      colour = Condition
+    ),
+    size = 2.8,
+    fontface = "bold",
+    show.legend = FALSE,
+    fill = "white",
+    alpha = 0.7
+  ) +
+
+  scale_colour_manual(
+    values = p3_colours
+  ) +
+
+  theme_classic(
+    base_size = 13
+  ) +
+
+  labs(
+    title = "Aortic Stenosis PCA — Top 500 Most Variable Proteins",
+    subtitle = paste(
+      "Variance calculated blind to condition labels — exploratory"
+    ),
+    x = paste0(
+      "PC1 (",
+      p3_pv_top500[1],
+      "%)"
+    ),
+    y = paste0(
+      "PC2 (",
+      p3_pv_top500[2],
+      "%)"
+    )
+  )
+
+
+print(p3_pca_top500_plot)
+
+
+ggsave(
+  "P3/P3_PCA_top500.pdf",
+  p3_pca_top500_plot,
+  width = 8,
+  height = 7
+)
+
+
+################################
+# STEP 17 — COMBINED PCA FIGURE
+
+p3_pca_combined <- p3_pca_plot +
+  p3_pca_top500_plot +
+  plot_annotation(
+    title = "Aortic Stenosis — PCA comparison",
+
+    caption = paste0(
+      "Left: full denoised proteome (",
+      nrow(p3_expr_final),
+      " proteins).\n",
+      "Right: top 500 most variable proteins ",
+      "(variance blind to condition labels).\n",
+      "Increased within-group scatter reflects ",
+      "single technical replicate per AS sample."
+    ),
+
+    theme = theme(
+      plot.title = element_text(
+        face = "bold",
+        hjust = 0.5,
+        size = 13
+      ),
+
+      plot.caption = element_text(
+        colour = "grey40",
+        size = 8
+      )
+    )
+  )
+
+
+print(p3_pca_combined)
+
+
+ggsave(
+  "P3/P3_PCA_combined.pdf",
+  p3_pca_combined,
+  width = 15,
+  height = 7
+)
+
+
+
+################################
+# PIPELINE 3 COMPLETE
+
+cat("PIPELINE 3 COMPLETE\n")
+
+cat("\nOutput files:\n")
+
+cat("  P3_PCA_trajectories.pdf\n")
+cat("  P3_PCA_top500.pdf\n")
+cat("  P3_PCA_combined.pdf\n")
+
+cat("  P3_Volcano_Baseline.pdf\n")
+cat("  P3_Volcano_Nintedanib.pdf\n")
+cat("  P3_Volcano_Senicapoc.pdf\n")
+
+cat("  P3_Heatmap_all_contrasts.pdf\n")
+cat("  P3_Heatmap_baseline_all_conditions.pdf\n")
+cat("  P3_DrugEffects_nominal_barchart.pdf\n")
+
+cat("  P3_Baseline_all_proteins.csv\n")
+cat("  P3_Baseline_FDR_significant.csv\n")
+cat("  P3_Baseline_top20_FC.csv\n")
+
+cat("  P3_Nintedanib_all_proteins.csv\n")
+cat("  P3_Nintedanib_FDR_significant.csv\n")
+cat("  P3_Nintedanib_top20_FC.csv\n")
+
+cat("  P3_Senicapoc_all_proteins.csv\n")
+cat("  P3_Senicapoc_FDR_significant.csv\n")
+cat("  P3_Senicapoc_top20_FC.csv\n")
