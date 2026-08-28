@@ -274,8 +274,8 @@ cat(
 
 
 
-################################
-## STEP 2 DIFFERENTIALLY EXPRESSION ANALYSIS 
+###########################################################################
+## 2 DIFFERENTIALLY EXPRESSION ANALYSIS 
 
 
 # STEP 8 — LIMMA: SINGLE MODEL, THREE CONTRASTS 
@@ -295,7 +295,7 @@ p3_fit <- lmFit(
 )
 
 
-# Define all three contrasts
+# Define all three contrasts individuallly 
 p3_contrasts <- makeContrasts(
   Baseline   = TGFB1_DMSO - SF_DMSO_citric,
   Nintedanib = TGFB1_Nintedanib - TGFB1_DMSO,
@@ -314,7 +314,7 @@ p3_fit2 <- contrasts.fit(
 p3_fit2 <- eBayes(
   p3_fit2,
   trend = TRUE,
-  robust = TRUE
+  robust = TRUE #extra measure included to account for impact of singel replicate 
 )
  
 # HELPER FUNCTION 1 — EXTRACT LIMMA RESULTS 
