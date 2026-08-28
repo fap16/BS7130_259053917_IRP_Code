@@ -1,1 +1,481 @@
+# DRUG REPURPOSING ANALYSIS
 
+# Load required packages
+# Used for data manipulation, visualisation, Venn diagrams, and network analysis.
+
+setwd("/home/fap16/final_project")
+
+library(dplyr)
+library(tidyverse)
+library(ggplot2)
+library(ggVennDiagram)
+library(igraph)
+library(ggraph)
+library(tidygraph)
+library(RColorBrewer)
+library(conflicted)
+
+# fix common function-name conflicts between packages
+conflict_prefer("select",    "dplyr")
+conflict_prefer("filter",    "dplyr")
+conflict_prefer("count",     "dplyr")
+conflict_prefer("arrange",   "dplyr")
+conflict_prefer("summarise", "dplyr")
+conflict_prefer("rename",    "dplyr")
+conflict_prefer("mutate",    "dplyr")
+conflict_prefer("intersect", "base")
+conflict_prefer("union",     "base")
+conflict_prefer("setdiff",   "base")
+
+###############################
+# STEP 1 — GENE LISTS 
+
+# Define the 42 proteins shared between the IPF and AS analyses - from the shared fibrotic signature
+    #note - they can be simply imported, but slowed the code down so were simply defined
+
+shared_genes <- c(
+  "SERPINE1", "PLOD2", "COL3A1", "SERPINH1", "CKAP4",
+  "SERPIND1", "CFD", "C3", "HABP2", "APOA1",
+  "PLG", "TTR", "KNG1", "AHSG", "CFHR1",
+  "SERPINC1", "C9", "PGM5", "APOA4", "AKR1C1",
+  "GPNMB", "TFRC", "RPL35", "RPL5", "IGFBP7",
+  "RPL32", "RPL21", "ARCN1", "PTK7", "RPL22",
+  "RPS25", "P3H1", "FKBP10", "RPL27", "ELN",
+  "GPX8", "YBX1", "RPS10", "PHGDH", "KRTCAP2",
+  "SLC1A5", "SSR3"
+)
+
+# Load the complete IPF protein dataset and extract significant proteins
+ipf_all      <- read.csv("P2/P2_Baseline_all_proteins.csv", row.names = 1)
+ipf_sig_genes <- rownames(ipf_all[ipf_all$adj.P.Val < 0.1, ])
+
+# Load the complete AS protein dataset and extract significant proteins
+
+as_all       <- read.csv("P3/P3_Baseline_all_proteins.csv", row.names = 1)
+as_sig_genes <- rownames(as_all[as_all$adj.P.Val < 0.1, ])
+
+cat("=== GENE LIST SUMMARY ===\n")
+cat("IPF sig genes:    ", length(ipf_sig_genes), "\n")
+cat("AS sig genes:     ", length(as_sig_genes),  "\n")
+cat("Shared (42):      ", length(shared_genes),  "\n\n")
+
+
+
+# STEP 2 — LOAD NEDREX FILES - directly from the repurposed networks as tsv files 
+
+# Load the IPF drug-target interaction table.
+nedrex_ipf <- read.delim("drug_rep/nedrex_drug_target_IPF.tsv",
+                         sep = "\t", header = TRUE,
+                         stringsAsFactors = FALSE)
+
+# Standardise column names for downstream analysis.
+names(nedrex_ipf) <- c("drug_id", "target_id", "drug_name", "target_gene")
+
+cat("IPF file loaded:", nrow(nedrex_ipf), "drug-target pairs |",
+    length(unique(nedrex_ipf$drug_name)), "unique drugs\n")
+
+
+# Load the ranked top-100 AS drug candidates.
+nedrex_as_ranked <- read.delim("drug_rep/AS_drug_ranking-Top_100.tsv",
+                               sep = "\t", header = TRUE,
+                               stringsAsFactors = FALSE,
+                               comment.char = "")
+
+# Standardise the NeDRex column names.
+names(nedrex_as_ranked) <- c("drug_id", "drug_name", "score", "rank")
+
+cat("AS file loaded:", nrow(nedrex_as_ranked), "drug candidates\n")
+cat("AS top 5:\n")
+print(head(nedrex_as_ranked, 5))
+
+
+# Load the ranked top-100 shared IPF + AS drug candidates.
+nedrex_shared_ranked <- read.delim("drug_rep/Shared_drug_ranking-Top_100.tsv",
+                                   sep = "\t", header = TRUE,
+                                   stringsAsFactors = FALSE,
+                                   comment.char = "")
+
+names(nedrex_shared_ranked) <- c("drug_id", "drug_name", "score", "rank")
+
+cat("Shared file loaded:", nrow(nedrex_shared_ranked), "drug candidates\n")
+cat("Shared top 5:\n")
+print(head(nedrex_shared_ranked, 5))
+
+
+# Load the ranked top-100 IPF drug candidates.
+# This is used for cross-validation against the other ranked analyses.
+nedrex_ipf_ranked <- read.delim("drug_rep/IPF_drug_ranking-Top_100.tsv",
+                                sep = "\t", header = TRUE,
+                                stringsAsFactors = FALSE,
+                                comment.char = "")
+
+names(nedrex_ipf_ranked) <- c("drug_id", "drug_name", "score", "rank")
+
+cat("IPF ranked file loaded:", nrow(nedrex_ipf_ranked), "drug candidates\n")
+cat("IPF top 5:\n")
+print(head(nedrex_ipf_ranked, 5))
+
+
+# STEP 3 — EXTRACT DRUG LISTS
+
+# Summarise the IPF drug-target network by drug.
+summary_ipf <- nedrex_ipf %>%
+  dplyr::group_by(drug_name) %>%
+  dplyr::summarise(
+    n_targets = n(),
+    targets   = paste(target_gene, collapse = ", "),
+    .groups   = "drop"
+  ) %>%
+  dplyr::arrange(desc(n_targets))
+
+# Extract the ranked drug lists for all three analyses.
+drugs_ipf    <- as.character(nedrex_ipf_ranked$drug_name)
+drugs_as     <- as.character(nedrex_as_ranked$drug_name)
+drugs_shared <- as.character(nedrex_shared_ranked$drug_name)
+
+cat("\n=== DRUG LIST SIZES ===\n")
+cat("IPF:    ", length(drugs_ipf),    "unique drugs\n")
+cat("AS:     ", length(drugs_as),     "unique drugs\n")
+cat("Shared: ", length(drugs_shared), "unique drugs\n\n")
+
+
+# Check the rank of nintedanib across all three analyses.
+# This provides an internal validation against a known IPF treatment.
+cat("=== NINTEDANIB RANKS ===\n")
+cat("IPF rank:    ",
+    nedrex_ipf_ranked$rank[nedrex_ipf_ranked$drug_name == "Nintedanib"], "\n")
+cat("AS rank:     ",
+    nedrex_as_ranked$rank[nedrex_as_ranked$drug_name == "Nintedanib"], "\n")
+cat("Shared rank: ",
+    nedrex_shared_ranked$rank[nedrex_shared_ranked$drug_name == "Nintedanib"], "\n\n")
+
+
+# STEP 4 — CROSS VALIDATION
+
+# Identify drugs shared between each pair of analyses.
+overlap_ipf_as     <- base::intersect(drugs_ipf, drugs_as)
+overlap_ipf_shared <- base::intersect(drugs_ipf, drugs_shared)
+overlap_as_shared  <- base::intersect(drugs_as,  drugs_shared)
+
+# Identify drugs appearing in all three top-100 lists.
+overlap_all <- Reduce(base::intersect,
+                      list(drugs_ipf, drugs_as, drugs_shared))
+
+cat("=== CROSS-VALIDATION SUMMARY ===\n")
+cat("IPF & AS overlap:       ", length(overlap_ipf_as),     "\n")
+cat("IPF & Shared overlap:   ", length(overlap_ipf_shared), "\n")
+cat("AS & Shared overlap:    ", length(overlap_as_shared),  "\n")
+cat("ALL THREE overlap:      ", length(overlap_all),        "\n\n")
+
+cat("Drugs in all three analyses:\n")
+print(overlap_all)
+
+# STEP 5 — MASTER REPURPOSING TABLE
+
+# Combine all candidate drugs and record:
+# - presence in each analysis
+# - IPF target count
+# - NeDRex scores and ranks
+# - number of significant/shared protein hits
+
+all_drugs <- unique(c(drugs_ipf, drugs_as, drugs_shared))
+
+master_table <- data.frame(
+  Drug          = all_drugs,
+  In_IPF        = all_drugs %in% drugs_ipf,
+  In_AS         = all_drugs %in% drugs_as,
+  In_Shared     = all_drugs %in% drugs_shared,
+  IPF_n_targets = sapply(all_drugs, function(d) {
+    sum(nedrex_ipf$drug_name == d)
+  }),
+  IPF_score     = nedrex_ipf_ranked$score[
+    match(all_drugs, nedrex_ipf_ranked$drug_name)],
+  IPF_rank      = nedrex_ipf_ranked$rank[
+    match(all_drugs, nedrex_ipf_ranked$drug_name)],
+  AS_score      = nedrex_as_ranked$score[
+    match(all_drugs, nedrex_as_ranked$drug_name)],
+  AS_rank       = nedrex_as_ranked$rank[
+    match(all_drugs, nedrex_as_ranked$drug_name)],
+  Shared_score  = nedrex_shared_ranked$score[
+    match(all_drugs, nedrex_shared_ranked$drug_name)],
+  Shared_rank   = nedrex_shared_ranked$rank[
+    match(all_drugs, nedrex_shared_ranked$drug_name)],
+  Hits_IPF_sig  = sapply(all_drugs, function(d) {
+    sum(nedrex_ipf$target_gene[nedrex_ipf$drug_name == d] %in% ipf_sig_genes)
+  }),
+  Hits_AS_sig   = sapply(all_drugs, function(d) {
+    sum(nedrex_ipf$target_gene[nedrex_ipf$drug_name == d] %in% as_sig_genes)
+  }),
+  Hits_Shared   = sapply(all_drugs, function(d) {
+    sum(nedrex_ipf$target_gene[nedrex_ipf$drug_name == d] %in% shared_genes)
+  }),
+  stringsAsFactors = FALSE
+) %>%
+  dplyr::mutate(
+    N_analyses = as.integer(In_IPF) +
+      as.integer(In_AS) +
+      as.integer(In_Shared)
+  ) %>%
+  dplyr::arrange(desc(N_analyses), desc(IPF_n_targets))
+
+cat("=== MASTER REPURPOSING TABLE (top 20) ===\n")
+print(head(master_table, 20))
+
+write.csv(master_table,
+          "drug_rep/Aim4_master_repurposing_table.csv",
+          row.names = FALSE)
+
+cat("Saved: Aim4_master_repurposing_table.csv\n")
+
+
+# Keep candidates supported by at least two analyses!
+cross_validated <- master_table %>%
+  dplyr::filter(N_analyses >= 2) %>%
+  dplyr::arrange(desc(N_analyses), desc(IPF_n_targets))
+
+cat("\n=== CROSS-VALIDATED CANDIDATES (2+ analyses) ===\n")
+print(cross_validated)
+
+write.csv(cross_validated,
+          "drug_rep/Aim4_crossvalidated_drugs.csv",
+          row.names = FALSE)
+
+
+# Keep only candidates appearing in all three analyses.
+triple_validated <- master_table %>%
+  dplyr::filter(N_analyses == 3) %>%
+  dplyr::arrange(desc(Hits_Shared), desc(IPF_n_targets))
+
+cat("\n=== TRIPLE VALIDATED (all three analyses) ===\n")
+cat("Total:", nrow(triple_validated), "drugs\n")
+
+print(triple_validated[, c("Drug", "IPF_rank", "AS_rank",
+                           "Shared_rank", "IPF_score",
+                           "AS_score", "Shared_score")])
+
+write.csv(triple_validated,
+          "drug_rep/Aim4_crossvalidated_drugs_triple.csv",
+          row.names = FALSE)
+
+cat("Saved: Aim4_crossvalidated_drugs_triple.csv\n")
+
+# STEP 6 — TOP IPF CANDIDATES TABLE
+
+# Select the top 20 IPF candidates by number of drug-target interactions
+# and show whether they also appear in the AS/shared ranked lists.
+
+top_ipf_table <- summary_ipf %>%
+  dplyr::slice_head(n = 20) %>%
+  dplyr::mutate(
+    In_AS        = drug_name %in% drugs_as,
+    In_Shared    = drug_name %in% drugs_shared,
+    IPF_score    = nedrex_ipf_ranked$score[
+      match(drug_name, nedrex_ipf_ranked$drug_name)],
+    IPF_rank     = nedrex_ipf_ranked$rank[
+      match(drug_name, nedrex_ipf_ranked$drug_name)],
+    AS_score     = nedrex_as_ranked$score[
+      match(drug_name, nedrex_as_ranked$drug_name)],
+    Shared_score = nedrex_shared_ranked$score[
+      match(drug_name, nedrex_shared_ranked$drug_name)]
+  )
+
+cat("\n=== TOP 20 IPF DRUG CANDIDATES ===\n")
+print(top_ipf_table)
+
+write.csv(top_ipf_table,
+          "drug_rep/Aim4_top_IPF_drugs.csv",
+          row.names = FALSE)
+
+
+
+# STEP 7 — VENN DIAGRAM
+
+# Visualise overlap between the three top-100 drug candidate lists.
+
+drug_venn_list <- list(
+  "IPF"             = as.character(drugs_ipf),
+  "AS"              = as.character(drugs_as),
+  "Shared Fibrotic" = as.character(drugs_shared)
+)
+
+p_venn <- ggVennDiagram(
+  drug_venn_list,
+  label_alpha = 0
+) +
+  scale_fill_gradient(low = "white", high = "#9C27B0") +
+  labs(
+    title    = "Drug repurposing candidates — cross-disease overlap",
+    subtitle = "NeDRex DIAMOnD network analysis | IPF, AS and shared fibrotic signature"
+  ) +
+  theme(
+    plot.title      = element_text(face = "bold", hjust = 0.5, size = 13),
+    plot.subtitle   = element_text(hjust = 0.5, size = 9, colour = "grey40"),
+    legend.position = "none"
+  )
+
+print(p_venn)
+
+ggsave("drug_rep/Aim4_drug_overlap_venn.pdf",
+       p_venn, width = 8, height = 7)
+
+cat("Saved: Aim4_drug_overlap_venn.pdf\n")
+
+ 
+# STEP 8 — DRUG TARGET NETWORK — ALL TRIPLE-VALIDATED DRUGS 
+
+# Build a drug-target network using candidates supported by all three analyses.
+# Target relationships are taken from the IPF NeDRex drug-target file.
+
+all_triple_drugs <- triple_validated$Drug
+
+network_df_triple <- nedrex_ipf %>%
+  dplyr::filter(drug_name %in% all_triple_drugs)
+
+cat("\nDrug-target pairs for triple-validated drugs:",
+    nrow(network_df_triple), "\n")
+
+cat("Unique drugs in IPF network:",
+    length(unique(network_df_triple$drug_name)), "\n")
+
+
+# Check whether any triple-validated drugs are missing from the IPF
+# drug-target interaction file.
+missing_from_ipf <- all_triple_drugs[
+  !all_triple_drugs %in% nedrex_ipf$drug_name]
+
+cat("Triple-validated drugs not in IPF target file:",
+    length(missing_from_ipf), "\n")
+
+if (length(missing_from_ipf) > 0) print(missing_from_ipf)
+
+
+# Convert drug-target relationships into network edges.
+edges_triple <- network_df_triple %>%
+  dplyr::select(drug_name, target_gene) %>%
+  dplyr::rename(from = drug_name, to = target_gene)
+
+
+# Create and classify drug/protein network nodes.
+nodes_triple <- data.frame(
+  name = unique(c(edges_triple$from, edges_triple$to)),
+  stringsAsFactors = FALSE
+) %>%
+  dplyr::mutate(
+    type     = ifelse(name %in% edges_triple$from, "Drug", "Protein"),
+    category = dplyr::case_when(
+      name %in% edges_triple$from ~ "Drug",
+      name %in% shared_genes      ~ "Shared IPF & AS",
+      name %in% ipf_sig_genes     ~ "IPF significant",
+      TRUE                        ~ "Network protein"
+    )
+  )
+
+cat("\nNetwork node categories:\n")
+print(table(nodes_triple$category))
+
+
+# Construct the undirected drug-target network.
+g_triple <- tbl_graph(
+  nodes = nodes_triple,
+  edges = edges_triple,
+  directed = FALSE
+)
+
+
+# Visualise the network.
+# Red = drug
+# Purple = shared IPF & AS protein
+# Blue = IPF significant protein
+# Grey = other network protein
+
+p_network_triple <- ggraph(g_triple, layout = "fr") +
+  geom_edge_link(alpha = 0.20, colour = "grey60", linewidth = 0.3) +
+  geom_node_point(aes(colour = category, size = type)) +
+  geom_node_label(
+    aes(label = name, colour = category),
+    size         = 2.2,
+    repel        = TRUE,
+    show.legend  = FALSE,
+    max.overlaps = 30
+  ) +
+  scale_colour_manual(values = c(
+    "Drug"            = "#E53935",
+    "Shared IPF & AS" = "#9C27B0",
+    "IPF significant" = "#2196F3",
+    "Network protein" = "grey70"
+  )) +
+  scale_size_manual(values = c("Drug" = 5, "Protein" = 3)) +
+  theme_graph(base_size = 11) +
+  labs(
+    title    = "Drug-target network — cross-validated fibrotic candidates",
+    subtitle = paste0(
+      "All triple-validated drugs (IPF + AS + Shared)  |  ",
+      "Red = drug  |  Purple = shared IPF & AS protein  |  ",
+      "Blue = IPF significant protein"
+    ),
+    colour = NULL,
+    size   = NULL
+  ) +
+  theme(
+    plot.title      = element_text(face = "bold", hjust = 0.5, size = 13),
+    plot.subtitle   = element_text(hjust = 0.5, size = 9, colour = "grey40"),
+    legend.position = "bottom"
+  )
+
+print(p_network_triple)
+
+ggsave("drug_rep/Aim4_drug_target_network_triple.pdf",
+       p_network_triple, width = 16, height = 14)
+
+cat("Saved: Aim4_drug_target_network_triple.pdf\n")
+
+ 
+# STEP 9 — SUMMARY 
+
+# Print the main outputs from the complete drug repurposing pipeline.
+
+cat("\n=== AIM 4 COMPLETE ===\n")
+
+cat("Key findings:\n")
+cat("  Drugs in all three analyses:  ", length(overlap_all),    "\n")
+cat("  Drugs in 2+ analyses:         ", nrow(cross_validated),  "\n")
+cat("  Triple validated candidates:  ", nrow(triple_validated), "\n\n")
+
+
+# Nintedanib provides an internal validation against a known IPF treatment.
+cat("=== NINTEDANIB INTERNAL VALIDATION ===\n")
+
+cat("IPF rank:    ",
+    nedrex_ipf_ranked$rank[nedrex_ipf_ranked$drug_name == "Nintedanib"], "\n")
+
+cat("AS rank:     ",
+    nedrex_as_ranked$rank[nedrex_as_ranked$drug_name == "Nintedanib"], "\n")
+
+cat("Shared rank: ",
+    nedrex_shared_ranked$rank[nedrex_shared_ranked$drug_name == "Nintedanib"], "\n")
+
+
+# Report selected candidate drugs for downstream interpretation.
+cat("\n=== TOP NOVEL CANDIDATES ===\n")
+
+cat("Fostamatinib — AS rank:",
+    nedrex_as_ranked$rank[nedrex_as_ranked$drug_name == "Fostamatinib"],
+    "| Shared rank:",
+    nedrex_shared_ranked$rank[nedrex_shared_ranked$drug_name == "Fostamatinib"], "\n")
+
+cat("Fedratinib   — AS rank:",
+    nedrex_as_ranked$rank[nedrex_as_ranked$drug_name == "Fedratinib"],
+    "| Shared rank:",
+    nedrex_shared_ranked$rank[nedrex_shared_ranked$drug_name == "Fedratinib"], "\n")
+
+cat("NADH         — IPF rank:",
+    nedrex_ipf_ranked$rank[nedrex_ipf_ranked$drug_name == "NADH"],
+    "| Shared rank:",
+    nedrex_shared_ranked$rank[nedrex_shared_ranked$drug_name == "NADH"], "\n")
+
+cat("Tenecteplase         — IPF rank:", #included out of curiousity - due to target of key overlapping pathways
+    nedrex_ipf_ranked$rank[nedrex_ipf_ranked$drug_name == "Tenecteplase"],
+    "| Shared rank:",
+    nedrex_shared_ranked$rank[nedrex_shared_ranked$drug_name == "Tenecteplase"],
+    "| AS rank:",
+    nedrex_as_ranked$rank[nedrex_as_ranked$drug_name == "Tenecteplase"],"\n")
