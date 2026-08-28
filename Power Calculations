@@ -1,1 +1,628 @@
 
+# POWER CALCULATIONS
+
+# PURPOSE:
+# Estimate how many donors would be required to reliably detect effects
+# observed in the current IPF and AS datasets.
+#
+# OVERALL PIPELINE:
+#   1. Estimate observed effect sizes from the limma t-statistics
+#   2. Define multiple-testing significance thresholds
+#   3. Calculate required sample sizes across a range of effect sizes
+#   4. Calculate required sample sizes for the effects observed in this study
+#   5. Plot power curves for Aim 1 and Aim 3
+#   6. Create a summary table comparing current vs required sample sizes
+#   7. Estimate how many proteins may become detectable with larger cohorts
+#
+# NOTE:the calculations are estimates based on protein fold change & (FDR <0.1) p val- not a confirmed value!
+
+
+# Load packages
+# pwr = power/sample-size calculations
+# ggplot2 + tidyverse = plotting and data manipulation
+
+library(pwr)
+library(ggplot2)
+library(tidyverse)
+
+
+# STEP 1: EXTRACT OBSERVED EFFECT SIZES FROM LIMMA DEA RESULTS
+#
+# Limma provides moderated t-statistics for each protein.
+# Here, the average absolute t-statistic is converted into an approximate
+# Cohen's d to provide an estimate of the observed effect size.
+#
+# These effect sizes are then used to ask:
+# "How many donors would be needed to detect an effect of this magnitude
+# with 80% statistical power?"
+
+##################################################
+# IPF baseline — Aim 1
+
+ipf_t   <- results_baseline$t
+ipf_d   <- mean(abs(ipf_t), na.rm = TRUE) / sqrt(nrow(samples_f) / 2)
+
+cat("Observed Cohen's d (IPF baseline):", round(ipf_d, 3), "\n")
+
+# AS baseline — Aim 1
+
+as_t    <- p3_results_baseline$t
+as_d    <- mean(abs(as_t), na.rm = TRUE) / sqrt(nrow(p3_samples) / 2)
+
+cat("Observed Cohen's d (AS baseline):", round(as_d, 3), "\n")
+
+
+# IPF drug contrasts — Aim 3
+
+# Nintedanib treatment
+nin_t   <- results_nintedanib$t
+nin_d   <- mean(abs(nin_t), na.rm = TRUE) / sqrt(nrow(samples_f) / 2)
+
+cat("Observed Cohen's d (IPF Nintedanib):", round(nin_d, 3), "\n")
+
+
+# Senicapoc treatment
+sen_t   <- results_senicapoc$t
+sen_d   <- mean(abs(sen_t), na.rm = TRUE) / sqrt(nrow(samples_f) / 2)
+
+cat("Observed Cohen's d (IPF Senicapoc):", round(sen_d, 3), "\n")
+
+
+# AS drug contrasts — Aim 3
+
+# Nintedanib treatment
+as_nin_t <- p3_results_nintedanib$t
+as_nin_d <- mean(abs(as_nin_t), na.rm = TRUE) / sqrt(nrow(p3_samples) / 2)
+
+cat("Observed Cohen's d (AS Nintedanib):", round(as_nin_d, 3), "\n")
+
+
+# Senicapoc treatment
+as_sen_t <- p3_results_senicapoc$t
+as_sen_d <- mean(abs(as_sen_t), na.rm = TRUE) / sqrt(nrow(p3_samples) / 2)
+
+cat("Observed Cohen's d (AS Senicapoc):", round(as_sen_d, 3), "\n")
+
+####################################
+# STEP 2: DEFINE SIGNIFICANCE THRESHOLDS
+# Approximately 1,500 proteins are assumed to have been tested.
+#
+# Because many proteins are tested simultaneously, the significance threshold
+# needs to account for multiple testing.
+#
+# The Bonferroni approximation below converts the desired FDR thresholds into
+# much stricter per-test alpha values for the power calculation.
+
+n_proteins  <- 1500   # approximate proteins tested
+
+alpha_fdr05 <- 0.05 / n_proteins   # Bonferroni approximation for FDR<0.05
+alpha_fdr10 <- 0.10 / n_proteins   # your current threshold
+
+cat("\nBonferroni alpha for FDR<0.05:", signif(alpha_fdr05, 3), "\n")
+cat("Bonferroni alpha for FDR<0.10:", signif(alpha_fdr10, 3), "\n")
+
+
+##############################################
+# STEP 3: CALCULATE REQUIRED SAMPLE SIZE ACROSS EFFECT SIZES
+#
+# Before looking specifically at your observed effects, calculate how many
+# donors would be required for several example effect sizes.
+#
+# Cohen's d values:
+#   0.5 = moderate effect
+#   0.8 = large effect
+#   1.0 = very large effect
+#   1.5 = very large effect
+#   2.0 = extremely large effect
+#
+# The calculation assumes:
+#   - two independent groups
+#   - 80% power
+#   - the specified significance threshold
+#
+# The result is the number of donors required PER GROUP !
+
+effect_sizes <- c(0.5, 0.8, 1.0, 1.5, 2.0)
+
+
+# Function to calculate the required number of donors for a given
+# effect size and significance threshold.
+calc_n <- function(d, alpha) {
+  ceiling(pwr.t.test(
+    d         = d,
+    sig.level = alpha,
+    power     = 0.80,
+    type      = "two.sample"
+  )$n)
+}
+
+
+# Create a table showing required sample size for each effect size.
+# FC_approx provides an approximate fold-change interpretation of Cohen's d.
+power_table <- data.frame(
+  Cohen_d      = effect_sizes,
+  FC_approx    = round(2^(effect_sizes * sqrt(2/3)), 2),
+  N_FDR05      = sapply(effect_sizes, calc_n, alpha = alpha_fdr05),
+  N_FDR10      = sapply(effect_sizes, calc_n, alpha = alpha_fdr10)
+)
+
+cat("\n=== POWER TABLE ===\n")
+print(power_table)
+
+#############################################
+# STEP 4: SAMPLE SIZE REQUIRED FOR THE OBSERVED EFFECTS
+#
+# Now move from theoretical effect sizes to the actual effect sizes observed
+# in this study.
+#
+# Each comparison is assigned its observed Cohen's d.
+# The code then calculates how many donors would be required to detect that
+# effect at:
+#
+#   - FDR < 0.05
+#   - FDR < 0.10
+#
+# This allows the current small datasets to be compared with a hypothetical
+# adequately powered study.
+
+cat("\n=== N REQUIRED AT OBSERVED EFFECT SIZES ===\n")
+
+
+# Store the observed effect size for each biological comparison.
+comparisons <- list(
+  "IPF Baseline (Aim 1)"       = ipf_d,
+  "AS Baseline (Aim 1)"        = as_d,
+  "IPF Nintedanib (Aim 3)"     = nin_d,
+  "IPF Senicapoc (Aim 3)"      = sen_d,
+  "AS Nintedanib (Aim 3)"      = as_nin_d,
+  "AS Senicapoc (Aim 3)"       = as_sen_d
+)
+
+
+# Calculate the sample size required for each observed effect.
+n_required <- data.frame(
+  Comparison   = names(comparisons),
+  Cohen_d      = round(unlist(comparisons), 3),
+  FC_approx    = round(2^(unlist(comparisons) * sqrt(2/3)), 2),
+  N_for_FDR05  = sapply(unlist(comparisons), calc_n, alpha = alpha_fdr05),
+  N_for_FDR10  = sapply(unlist(comparisons), calc_n, alpha = alpha_fdr10)
+)
+
+print(n_required)
+
+
+# Save the required sample-size calculations.
+write.csv(n_required, "Power_calculation_results.csv", row.names = FALSE)
+
+
+################################
+# STEP 5: POWER CURVES
+#
+# The following function creates a power curve showing how required sample
+# size changes as the effect size increases.
+#
+# Two curves are shown:
+#
+#   Red/orange = stricter FDR < 0.05 threshold
+#   Orange      = current FDR < 0.10 threshold
+#
+# The horizontal lines show the current sample sizes:
+#
+#   n = 3 → IPF
+#   n = 5 → AS
+#
+# Red points show the effect sizes actually observed in the study.
+
+
+plot_power <- function(title_str, observed_d_list, filename) {
+  
+  # Generate a range of possible effect sizes.
+  
+  d_range <- seq(0.3, 2.5, by = 0.05)
+  
+  
+  # Calculate required sample size across the effect-size range
+  # for both multiple-testing thresholds.
+  
+  curve_df <- data.frame(
+    Cohen_d   = rep(d_range, 2),
+    N         = c(
+      sapply(d_range, calc_n, alpha = alpha_fdr05),
+      sapply(d_range, calc_n, alpha = alpha_fdr10)
+    ),
+    Threshold = rep(c("FDR<0.05 (gold standard)", "FDR<0.10 (current)"),
+                    each = length(d_range))
+  )
+  
+  
+   # Add the effect sizes observed in the current study.
+  
+  obs_df <- data.frame(
+    Comparison = names(observed_d_list),
+    Cohen_d    = unlist(observed_d_list),
+    N_FDR05    = sapply(unlist(observed_d_list), calc_n, alpha = alpha_fdr05)
+  )
+  
+  
+    # Plot the power curves and current sample sizes.
+   
+  p <- ggplot(curve_df, aes(x = Cohen_d, y = N, colour = Threshold,
+                            linetype = Threshold)) +
+    geom_line(linewidth = 1.1) +
+    
+    # Current sample size for IPF
+    geom_hline(yintercept = 3, linetype = "dotted",
+               colour = "grey40", linewidth = 0.6) +
+    
+    # Current sample size for AS
+    geom_hline(yintercept = 5, linetype = "dotted",
+               colour = "steelblue", linewidth = 0.6) +
+    
+    annotate("text", x = 2.3, y = 4.2,
+             label = "Current n=3 (IPF/Healthy)",
+             size = 3, colour = "grey40") +
+    
+    annotate("text", x = 2.3, y = 6.2,
+             label = "Current n=5 (AS)",
+             size = 3, colour = "steelblue") +
+    
+    # Mark the observed effect sizes from the study.
+    geom_point(data = obs_df,
+               aes(x = Cohen_d, y = N_FDR05),
+               colour = "#E53935", size = 3,
+               inherit.aes = FALSE) +
+    
+    geom_text(data = obs_df,
+              aes(x = Cohen_d, y = N_FDR05,
+                  label = Comparison),
+              size = 2.5, vjust = -0.8, hjust = 0,
+              colour = "#E53935",
+              inherit.aes = FALSE) +
+    
+    scale_colour_manual(values = c(
+      "FDR<0.05 (gold standard)" = "#E53935",
+      "FDR<0.10 (current)"       = "#FF9800"
+    )) +
+    
+    scale_y_continuous(limits = c(0, 220),
+                       breaks = seq(0, 220, 20)) +
+    
+    scale_x_continuous(breaks = seq(0.5, 2.5, 0.5)) +
+    
+    theme_classic(base_size = 12) +
+    
+    labs(
+      title    = title_str,
+      subtitle = "80% power | ~1500 proteins tested | Bonferroni multiple testing correction\nRed points = observed effect sizes from this study",
+      x        = "Effect size (Cohen's d)",
+      y        = "Donors required per group",
+      colour   = NULL,
+      linetype = NULL
+    ) +
+    
+    theme(
+      legend.position = "bottom",
+      plot.title      = element_text(face = "bold", hjust = 0.5),
+      plot.subtitle   = element_text(hjust = 0.5, size = 8, colour = "grey40")
+    )
+  
+  
+  # Display the plot and save it as a PDF.
+  print(p)
+  
+  ggsave(filename, p, width = 9, height = 7)
+  
+  cat("Saved:", filename, "\n")
+}
+
+
+# Aim 1 power curve
+#
+# Compares the baseline IPF and AS effect sizes.
+
+plot_power(
+  title_str        = "Power calculation — Aim 1: Cross-disease overlap\nDonors required for FDR<0.05 & |log\u2082FC|>0.58",
+  observed_d_list  = list(
+    "IPF baseline" = ipf_d,
+    "AS baseline"  = as_d
+  ),
+  filename         = "Aim1_power_calculation.pdf"
+)
+
+
+# Aim 3 power curve
+# Compares the treatment-response effect sizes for Nintedanib and Senicapoc
+# in both IPF and AS.
+
+plot_power(
+  title_str        = "Power calculation — Aim 3: Antifibrotic treatment response\nDonors required for FDR<0.05 & |log\u2082FC|>0.58",
+  observed_d_list  = list(
+    "IPF Nintedanib" = nin_d,
+    "IPF Senicapoc"  = sen_d,
+    "AS Nintedanib"  = as_nin_d,
+    "AS Senicapoc"   = as_sen_d
+  ),
+  filename         = "Aim3_power_calculation.pdf"
+)
+
+
+cat("\n=== POWER CALCULATIONS COMPLETE ===\n")
+
+######################
+# STEP 6: SUMMARY TABLE
+#
+# This table puts the current study results next to the estimated sample size
+# required to achieve FDR < 0.05.
+#
+# It provides a simple way to communicate whether the current experiments are
+# adequately powered or whether substantially larger cohorts would be needed.
+########
+
+summary_table <- data.frame(
+  Comparison = c(
+    "IPF Baseline (Aim 1)",
+    "AS Baseline (Aim 1)",
+    "IPF Nintedanib (Aim 3)",
+    "IPF Senicapoc (Aim 3)",
+    "AS Nintedanib (Aim 3)",
+    "AS Senicapoc (Aim 3)"
+  ),
+  Current_n = c(3, 5, 3, 3, 5, 5),
+  Current_threshold = c(
+    "FDR<0.1 & |logFC|>0.58",
+    "FDR<0.1 & |logFC|>0.58",
+    "FDR<0.1 & |logFC|>0.58",
+    "FDR<0.1 & |logFC|>0.58",
+    "Nominal p<0.05",
+    "Nominal p<0.05"
+  ),
+  Proteins_identified = c(359, 133, 59, 42, 0, 0),
+  Cohen_d = c(1.209, 0.436, 0.503, 0.403, 0.258, 0.238),
+  FC_approx = c(1.98, 1.28, 1.33, 1.26, 1.16, 1.14),
+  N_required_FDR05 = c(39, 266, 202, 311, 751, 884)
+)
+
+
+# Print the summary table.
+cat("=== CURRENT FINDINGS VS REQUIRED N FOR FDR<0.05 ===\n\n")
+print(summary_table)
+
+
+# Save the summary table.
+write.csv(summary_table, "Power_summary_table.csv", row.names = FALSE)
+
+################################
+# STEP 7: CREATE A SUMMARY TABLE FIGURE
+#
+# Convert the summary table into a formatted PDF figure.
+#
+# Rows are coloured according to whether the current sample size reaches
+# the estimated required sample size.
+#
+# Green = current n is sufficient
+# Red   = current n is insufficient
+
+library(ggplot2)
+library(gridExtra)
+library(grid)
+
+
+# Build a simplified table specifically for qquick visual display.
+display_df <- data.frame(
+  Comparison            = summary_table$Comparison,
+  "Current n"           = summary_table$Current_n,
+  "Threshold used"      = summary_table$Current_threshold,
+  "Proteins found"      = summary_table$Proteins_identified,
+  "Cohen's d"           = summary_table$Cohen_d,
+  "FC observed"         = paste0(summary_table$FC_approx, "x"),
+  "n for FDR<0.05"      = summary_table$N_required_FDR05,
+  check.names           = FALSE
+)
+
+
+# Determine the background colour for each row.
+# This is based on whether the current sample size is at least as large
+# as the estimated required sample size.
+row_colours <- ifelse(summary_table$Current_n >= summary_table$N_required_FDR05,
+                      "#C8E6C9",   # green — sufficient
+                      "#FFCDD2")  # red — insufficient
+
+
+# Create the formatted table.
+p_table <- tableGrob(
+  display_df,
+  rows  = NULL,
+  theme = ttheme_minimal(
+    core    = list(
+      bg_params  = list(fill = row_colours, col = "white"),
+      fg_params  = list(fontsize = 8, hjust = 0, x = 0.05)
+    ),
+    colhead = list(
+      bg_params  = list(fill = "#37474F", col = "white"),
+      fg_params  = list(col = "white", fontsize = 9,
+                        fontface = "bold", hjust = 0.5, x = 0.5)
+    )
+  )
+)
+
+
+# Add title and explanatory subtitle.
+title_grob <- textGrob(
+  "Power analysis — current findings vs donors required for FDR<0.05",
+  gp = gpar(fontsize = 11, fontface = "bold")
+)
+
+subtitle_grob <- textGrob(
+  "Green = current n sufficient | Red = underpowered | 80% power | ~1500 proteins tested",
+  gp = gpar(fontsize = 8, col = "grey40")
+)
+
+
+# Combine title, subtitle and table into one figure.
+final_table <- arrangeGrob(
+  title_grob, subtitle_grob, p_table,
+  ncol    = 1,
+  heights = c(0.08, 0.05, 0.87)
+)
+
+
+# Save the formatted summary table.
+ggsave("Power_summary_table.pdf",
+       plot   = final_table,
+       width  = 14,
+       height = 5)
+
+cat("Saved: Power_summary_table.pdf\n")
+
+
+# STEP 8: ESTIMATE PROTEINS DETECTABLE WITH LARGER SAMPLE SIZES
+#
+# This final section asks a different question:
+#
+# "If the study had more donors, approximately how many proteins might become
+# detectable?"
+#
+# The function compares:
+#
+#   1. Proteins currently significant at FDR < 0.10
+#   2. Proteins with nominal p < 0.05
+#   3. A rough estimate of proteins that may become detectable with a larger n
+#
+# IMPORTANT:
+# This is an approximate exploratory estimate rather than a formal prospective
+# power calculation. It is intended to illustrate the potential benefit of
+# increasing sample size.
+
+
+estimate_proteins <- function(results_df, label, target_n, current_n) {
+  
+  
+   # Count proteins currently significant using the study's FDR/logFC criteria.
+   
+  current_sig <- sum(results_df$adj.P.Val < 0.1 & abs(results_df$logFC) > 0.58)
+  
+  
+  # Approximate how much statistical power increases with sample size.
+  #
+  # The approximation assumes that power scales with sqrt(n).
+   
+  power_ratio <- sqrt(target_n / current_n)
+  
+  
+  # Count proteins that are nominally significant.
+    # These may represent effects that could potentially become significant
+  # after increasing sample size.
+ 
+nominal_sig <- sum(results_df$P.Value < 0.05 & abs(results_df$logFC) > 0.58)
+  
+  
+   # Create a rough estimate of how many proteins might become detectable
+  # at the larger target sample size.
+  
+  adjusted_alpha <- 0.05 * power_ratio
+  
+  estimated_sig <- sum(results_df$P.Value < adjusted_alpha &
+                         abs(results_df$logFC) > 0.58)
+  
+  # Print the results for this comparison.
+  
+  cat(sprintf("\n%s:\n", label))
+  
+  cat("  Current n:", current_n, "\n")
+  cat("  Target n:", target_n, "\n")
+  
+  cat("  Currently FDR<0.1 significant:", current_sig, "\n")
+  
+  cat("  Nominally significant (p<0.05):", nominal_sig, "\n")
+  
+  cat("  Estimated detectable at target n:", estimated_sig, "\n")
+  
+  
+  # Return the estimated number of detectable proteins.
+  return(estimated_sig)
+}
+
+#########################################################################
+# AIM 1 — ESTIMATED EFFECT OF INCREASING SAMPLE SIZE
+#
+# IPF: target n = 40
+# AS:  target n = 270
+#
+# These values correspond to the approximate sample sizes identified above
+# for detecting the observed effects at the stricter FDR threshold.
+
+estimate_proteins(
+  results_baseline,
+  "IPF Baseline",
+  target_n=40,
+  current_n=3
+)
+
+estimate_proteins(
+  p3_results_baseline,
+  "AS Baseline",
+  target_n=270,
+  current_n=5
+)
+
+
+#####################################
+# AIM 3 — ESTIMATED EFFECT OF INCREASING SAMPLE SIZE
+# Repeat the same analysis for the treatment-response comparisons.
+
+estimate_proteins(
+  results_nintedanib,
+  "IPF Nintedanib",
+  target_n=202,
+  current_n=3
+)
+
+estimate_proteins(
+  results_senicapoc,
+  "IPF Senicapoc",
+  target_n=311,
+  current_n=3
+)
+
+
+# AS treatment contrasts
+estimate_proteins(
+  p3_results_nintedanib,
+  "AS Nintedanib",
+  target_n=751,
+  current_n=5
+)
+
+estimate_proteins(
+  p3_results_senicapoc,
+  "AS Senicapoc",
+  target_n=884,
+  current_n=5
+)
+
+
+############################################################
+# END OF POWER ANALYSIS
+
+# MAIN OUTPUTS:
+#
+#   Power_calculation_results.csv
+#       -> Required sample sizes for each observed effect size
+#
+#   Aim1_power_calculation.pdf
+#       -> Aim 1 power curve
+#
+#   Aim3_power_calculation.pdf
+#       -> Aim 3 power curve
+#
+#   Power_summary_table.csv
+#       -> Current results vs required sample size
+#
+#   Power_summary_table.pdf
+#       -> Publication-style visual summary
+#
+# The analysis therefore moves from observed effect sizes -> required sample
+# sizes -> visual power curves -> current vs required sample sizes -> a rough
+# estimate of how many additional proteins could become detectable with
+# increased cohort sizes.
+# =============================================================================
